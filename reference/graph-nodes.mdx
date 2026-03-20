@@ -172,7 +172,7 @@ Fetches full comment data for the URLs selected by `analyze_reddit_posts` using 
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `reddit_post_data` | `list` | List of comment objects `{"comment_id", "content", "date"}`, or `[]` on failure |
+| `reddit_post_data` | `dict \| list` | `{"comments": [{"comment_id", "content", "date"}], "total_retrieved": int}` on success, or `[]` on failure/empty URLs |
 
 <Note>
 If `selected_reddit_urls` is empty, the node returns `{"reddit_post_data": []}` without making an API call.

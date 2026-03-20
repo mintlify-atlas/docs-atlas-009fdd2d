@@ -40,7 +40,7 @@ The Deep Research Agent solves this by:
     Google, Bing, and Reddit are queried simultaneously via Bright Data, cutting research time by up to 10×.
   </Card>
   <Card title="Async snapshot handling" icon="rotate">
-    Trigger → poll → download pattern with exponential backoff handles slow Reddit crawls reliably.
+    Trigger → poll → download pattern with configurable retry polling handles slow Reddit crawls reliably.
   </Card>
   <Card title="Layered LLM analysis" icon="layer-group">
     Each source is summarized independently before a higher-capacity model synthesizes a final answer.

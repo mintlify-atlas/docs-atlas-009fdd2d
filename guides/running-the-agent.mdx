@@ -159,7 +159,7 @@ After `graph.invoke()` returns, the state dict contains these keys populated by 
 | `bing_results` | `dict` | Raw SERP data from Bing (`knowledge`, `organic` keys) |
 | `reddit_results` | `dict` | Parsed Reddit posts (`parsed_posts`, `total_found` keys) |
 | `selected_reddit_urls` | `list[str]` | Reddit URLs the LLM selected for deep retrieval |
-| `reddit_post_data` | `dict` | Comments retrieved from selected posts (`comments`, `total_retrieved` keys) |
+| `reddit_post_data` | `dict \| list` | Comments dict (`comments`, `total_retrieved` keys) on success, or `[]` if no URLs were selected |
 | `google_analysis` | `str` | GPT-4o analysis of Google results |
 | `bing_analysis` | `str` | GPT-4o analysis of Bing results |
 | `reddit_analysis` | `str` | GPT-4o analysis of Reddit content |
