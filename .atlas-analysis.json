@@ -1,0 +1,94 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "Deep Research Agent",
+  "projectDescription": "A multi-source AI research agent that orchestrates parallel live searches across Google, Bing, and Reddit via Bright Data, then synthesizes results using GPT-4 into cited, structured answers.",
+  "theme": "palm",
+  "primaryColor": "#6366F1",
+  "lightColor": "#818CF8",
+  "darkColor": "#4338CA",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": ["introduction", "quickstart", "configuration"]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/langgraph-workflow",
+              "architecture/state-management"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/multi-source-search",
+              "concepts/snapshot-polling",
+              "concepts/llm-analysis",
+              "concepts/synthesis"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/running-the-agent",
+              "guides/extending-sources",
+              "guides/cost-optimization",
+              "guides/troubleshooting"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Reference",
+        "groups": [
+          {
+            "group": "API Reference",
+            "pages": [
+              "reference/graph-nodes",
+              "reference/web-operations",
+              "reference/snapshot-operations",
+              "reference/prompt-templates",
+              "reference/state-schema"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "integrations/brightdata",
+              "integrations/openai",
+              "integrations/langgraph"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Parallel multi-source search across Google, Bing, and Reddit simultaneously",
+    "Asynchronous snapshot handling with polling and exponential backoff via Bright Data",
+    "Layered LLM analysis: per-source summaries followed by cross-source synthesis",
+    "LangGraph orchestration with typed state, deterministic node wiring, and retries",
+    "Structured Pydantic outputs with citations and provenance for every claim",
+    "Modular, production-grade design extensible to additional data sources"
+  ],
+  "publicApiSurface": [
+    "run_chatbot() — interactive CLI entry point for submitting research queries",
+    "graph.invoke(state) — programmatic graph invocation with typed State dict",
+    "serp_search(query, engine) — Bright Data SERP scraping for Google and Bing",
+    "reddit_search_api(keyword, date, sort_by, num_of_posts) — Reddit keyword search via Bright Data snapshots",
+    "reddit_post_retrieval(urls, days_back, load_all_replies, comment_limit) — fetch Reddit post comments",
+    "poll_snapshot_status(snapshot_id, max_attempts, delay) — async snapshot readiness polling",
+    "download_snapshot(snapshot_id, format) — download completed Bright Data snapshot",
+    "get_google_analysis_messages(user_question, google_results) — prompt builder for Google analysis",
+    "get_bing_analysis_messages(user_question, bing_results) — prompt builder for Bing analysis",
+    "get_reddit_analysis_messages(user_question, reddit_results, reddit_post_data) — prompt builder for Reddit analysis",
+    "get_synthesis_messages(user_question, google_analysis, bing_analysis, reddit_analysis) — prompt builder for final synthesis",
+    "State TypedDict — typed shared state schema for the LangGraph workflow",
+    "RedditURLAnalysis Pydantic model — structured output schema for URL selection"
+  ]
+}
