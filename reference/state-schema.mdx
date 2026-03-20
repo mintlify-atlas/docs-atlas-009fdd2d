@@ -1,0 +1,126 @@
+---
+title: "State schema"
+description: "Complete reference for the State TypedDict and Pydantic output models"
+---
+
+The agent uses a single shared `State` object that flows through every node in the LangGraph. Nodes read fields they need and return partial dicts that update only the fields they write.
+
+---
+
+## `State` TypedDict
+
+Defined in `main.py`:
+
+```python
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
+    user_question: str | None
+    google_results: str | None
+    bing_results: str | None
+    reddit_results: str | None
+    selected_reddit_urls: list[str] | None
+    reddit_post_data: list | None
+    google_analysis: str | None
+    bing_analysis: str | None
+    reddit_analysis: str | None
+    final_answer: str | None
+```
+
+### Fields
+
+| Field | Type | Default | Set by | Read by |
+|-------|------|---------|--------|---------|
+| `messages` | `Annotated[list, add_messages]` | `[]` (via initial state) | `run_chatbot`, `synthesize_analyses` | — |
+| `user_question` | `str \| None` | `None` | `run_chatbot` | all search and analysis nodes |
+| `google_results` | `str \| None` | `None` | `google_search` | `analyze_google_results` |
+| `bing_results` | `str \| None` | `None` | `bing_search` | `analyze_bing_results` |
+| `reddit_results` | `str \| None` | `None` | `reddit_search` | `analyze_reddit_posts`, `analyze_reddit_results` |
+| `selected_reddit_urls` | `list[str] \| None` | `None` | `analyze_reddit_posts` | `retrieve_reddit_posts` |
+| `reddit_post_data` | `list \| None` | `None` | `retrieve_reddit_posts` | `analyze_reddit_results` |
+| `google_analysis` | `str \| None` | `None` | `analyze_google_results` | `synthesize_analyses` |
+| `bing_analysis` | `str \| None` | `None` | `analyze_bing_results` | `synthesize_analyses` |
+| `reddit_analysis` | `str \| None` | `None` | `analyze_reddit_results` | `synthesize_analyses` |
+| `final_answer` | `str \| None` | `None` | `synthesize_analyses` | `run_chatbot` |
+
+### The `messages` field and `add_messages`
+
+`messages` uses LangGraph's `add_messages` reducer, declared with Python's `Annotated` type:
+
+```python
+messages: Annotated[list, add_messages]
+```
+
+Instead of overwriting the list on each state update, `add_messages` **appends** incoming messages to the existing list. This means every node that returns `{"messages": [...]}` adds to the conversation history rather than replacing it.
+
+`synthesize_analyses` uses this to append the final assistant response:
+
+```python
+return {
+    "final_answer": final_answer,
+    "messages": [{"role": "assistant", "content": final_answer}]
+}
+```
+
+<Note>
+All other fields use standard TypedDict assignment — returning a key overwrites the previous value.
+</Note>
+
+---
+
+## `RedditURLAnalysis` Pydantic model
+
+Defined in `main.py`:
+
+```python
+class RedditURLAnalysis(BaseModel):
+    selected_urls: List[str] = Field(
+        description="List of Reddit URLs that contain valuable information for answering the user's question"
+    )
+```
+
+### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `selected_urls` | `List[str]` | Reddit post URLs chosen by the LLM as high-value for the current query |
+
+### Usage with structured output
+
+`analyze_reddit_posts` binds this model to the LLM using `with_structured_output`:
+
+```python
+structured_llm = llm.with_structured_output(RedditURLAnalysis)
+messages = get_reddit_url_analysis_messages(user_question, reddit_results)
+analysis = structured_llm.invoke(messages)
+selected_urls = analysis.selected_urls
+```
+
+LangChain's `with_structured_output` instructs the model to return JSON that conforms to the Pydantic schema, then parses and validates the response automatically. The node accesses the typed result via `analysis.selected_urls`.
+
+---
+
+## Initial state construction
+
+`run_chatbot` constructs a fresh state object for every query:
+
+```python
+state = {
+    "messages": [{"role": "user", "content": user_input}],
+    "user_question": user_input,
+    "google_results": None,
+    "bing_results": None,
+    "reddit_results": None,
+    "selected_reddit_urls": None,
+    "reddit_post_data": None,
+    "google_analysis": None,
+    "bing_analysis": None,
+    "reddit_analysis": None,
+    "final_answer": None,
+}
+```
+
+All nullable fields are explicitly initialized to `None` so that nodes can safely call `state.get("field", "")` or `state.get("field", [])` without raising `KeyError`.
+
+<Tip>
+When invoking the graph directly (without `run_chatbot`), you must supply this full initial state dict. Omitting any field may cause a node to receive an unexpected `None` from `.get()` and produce empty results.
+</Tip>

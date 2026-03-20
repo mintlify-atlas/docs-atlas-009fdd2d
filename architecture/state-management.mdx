@@ -1,0 +1,154 @@
+---
+title: "State management"
+description: "How the typed State TypedDict flows through the LangGraph pipeline"
+---
+
+The Deep Research Agent uses a single typed `State` object as the shared memory for the entire graph. Every node reads from it and writes a partial update back to it. No node holds internal state between invocations.
+
+## The State TypedDict
+
+```python main.py
+from typing import Annotated
+from langgraph.graph.message import add_messages
+from typing_extensions import TypedDict
+
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
+    user_question: str | None
+    google_results: str | None
+    bing_results: str | None
+    reddit_results: str | None
+    selected_reddit_urls: list[str] | None
+    reddit_post_data: list | None
+    google_analysis: str | None
+    bing_analysis: str | None
+    reddit_analysis: str | None
+    final_answer: str | None
+```
+
+## Field reference
+
+The table below maps each field to the node that writes it and the nodes that consume it:
+
+| Field | Type | Written by | Read by |
+|---|---|---|---|
+| `messages` | `Annotated[list, add_messages]` | `run_chatbot()` (initial), `synthesize_analyses` | LangGraph conversation history |
+| `user_question` | `str \| None` | `run_chatbot()` (initial) | All nodes that call the LLM or a search API |
+| `google_results` | `str \| None` | `google_search` | `analyze_google_results` |
+| `bing_results` | `str \| None` | `bing_search` | `analyze_bing_results` |
+| `reddit_results` | `str \| None` | `reddit_search` | `analyze_reddit_posts`, `analyze_reddit_results` |
+| `selected_reddit_urls` | `list[str] \| None` | `analyze_reddit_posts` | `retrieve_reddit_posts` |
+| `reddit_post_data` | `list \| None` | `retrieve_reddit_posts` | `analyze_reddit_results` |
+| `google_analysis` | `str \| None` | `analyze_google_results` | `synthesize_analyses` |
+| `bing_analysis` | `str \| None` | `analyze_bing_results` | `synthesize_analyses` |
+| `reddit_analysis` | `str \| None` | `analyze_reddit_results` | `synthesize_analyses` |
+| `final_answer` | `str \| None` | `synthesize_analyses` | `run_chatbot()` (printed to console) |
+
+## The `messages` field and `add_messages`
+
+The `messages` field uses Python's `Annotated` type with `add_messages` as a reducer:
+
+```python
+messages: Annotated[list, add_messages]
+```
+
+For most fields, LangGraph replaces the value when a node returns a new one. The `add_messages` reducer changes that behavior: instead of replacing the list, it **appends** new messages to the existing list. This lets the conversation history accumulate across invocations.
+
+In practice:
+- `run_chatbot()` seeds `messages` with the user's input as a human message
+- `synthesize_analyses` appends the final answer as an assistant message
+- The full conversation history is preserved in `messages` across multiple turns
+
+<Info>
+  `add_messages` also handles deduplication by message ID and supports OpenAI-style message dicts as well as LangChain `BaseMessage` objects.
+</Info>
+
+## Partial state updates
+
+Nodes return only the fields they are responsible for — not the full state. LangGraph merges the returned dict into the existing state:
+
+```python main.py
+# google_search only writes the field it owns
+def google_search(state: State):
+    user_question = state.get("user_question", "")
+    google_results = serp_search(user_question, engine="google")
+    return {"google_results": google_results}  # partial update — other fields unchanged
+```
+
+This pattern means:
+
+- Nodes are narrowly scoped and cannot accidentally overwrite each other's fields
+- Parallel nodes writing to different fields never conflict
+- You can add a new field to `State` without modifying any existing node
+
+<Note>
+  Because `google_search`, `bing_search`, and `reddit_search` each write to a different state field (`google_results`, `bing_results`, `reddit_results`), they can safely run in parallel without any locking or coordination.
+</Note>
+
+## Structured output with `RedditURLAnalysis`
+
+The `analyze_reddit_posts` node uses a Pydantic model to enforce a typed LLM response:
+
+```python main.py
+from pydantic import BaseModel, Field
+from typing import List
+
+class RedditURLAnalysis(BaseModel):
+    selected_urls: List[str] = Field(
+        description="List of Reddit URLs that contain valuable information "
+                    "for answering the user's question"
+    )
+```
+
+The node passes this model to `llm.with_structured_output()`:
+
+```python main.py
+structured_llm = llm.with_structured_output(RedditURLAnalysis)
+messages = get_reddit_url_analysis_messages(user_question, reddit_results)
+analysis = structured_llm.invoke(messages)
+selected_urls = analysis.selected_urls  # guaranteed to be List[str]
+```
+
+`with_structured_output` instructs the LLM to respond in a format that matches the Pydantic schema, then parses and validates the response. If the LLM returns malformed output, the call raises an exception that the node catches, falling back to an empty URL list.
+
+<Tip>
+  You can use `with_structured_output` with any Pydantic `BaseModel`. If you add a new analysis node that needs to return a score, a category, or a list of citations, define a model for it and use the same pattern.
+</Tip>
+
+## Initial state
+
+The state is initialized in `run_chatbot()` before each graph invocation:
+
+```python main.py
+state = {
+    "messages": [{"role": "user", "content": user_input}],
+    "user_question": user_input,
+    "google_results": None,
+    "bing_results": None,
+    "reddit_results": None,
+    "selected_reddit_urls": None,
+    "reddit_post_data": None,
+    "google_analysis": None,
+    "bing_analysis": None,
+    "reddit_analysis": None,
+    "final_answer": None,
+}
+final_state = graph.invoke(state)
+```
+
+All fields except `messages` and `user_question` start as `None`. Each node is responsible for checking whether the field it depends on is `None` before proceeding — for example, `analyze_reddit_posts` short-circuits to `{"selected_reddit_urls": []}` if `reddit_results` is falsy.
+
+<Note>
+  Each call to `graph.invoke(state)` starts a fresh state. The agent does not maintain memory between queries unless you persist and re-pass the `messages` list yourself.
+</Note>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="LangGraph workflow" icon="diagram-project" href="/architecture/langgraph-workflow">
+    See how nodes and edges are wired in the compiled graph
+  </Card>
+  <Card title="Architecture overview" icon="sitemap" href="/architecture/overview">
+    Revisit the high-level pipeline design
+  </Card>
+</CardGroup>

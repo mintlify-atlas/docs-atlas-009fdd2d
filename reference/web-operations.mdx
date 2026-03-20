@@ -1,0 +1,275 @@
+---
+title: "Web operations"
+description: "Reference for web_operations.py — Bright Data SERP and Reddit scraping functions"
+---
+
+`web_operations.py` provides three public functions that interface with the [Bright Data](https://brightdata.com) API to retrieve live web and Reddit data. All HTTP requests include a `Bearer` auth header built from `BRIGHTDATA_API_KEY`.
+
+<Info>
+All functions return `None` on any network or API error rather than raising exceptions. Always check the return value before using it.
+</Info>
+
+---
+
+## `serp_search`
+
+```python
+def serp_search(query, engine="google"):
+```
+
+Submits a SERP (Search Engine Results Page) request to Bright Data and returns structured knowledge panel and organic results.
+
+### Parameters
+
+<ParamField path="query" type="string" required>
+  The search query string, URL-encoded automatically before submission.
+</ParamField>
+
+<ParamField path="engine" type="string" default="google">
+  The search engine to use. Accepts `"google"` or `"bing"`. Any other value raises `ValueError`.
+</ParamField>
+
+### Returns
+
+<ResponseField name="knowledge" type="dict">
+  Structured knowledge panel data extracted from the SERP response. Empty dict if no knowledge panel was returned.
+</ResponseField>
+
+<ResponseField name="organic" type="list">
+  List of organic search result objects from the SERP response.
+</ResponseField>
+
+Returns `None` if the request fails.
+
+### Source
+
+```python
+def serp_search(query, engine="google"):
+    if engine == "google":
+        base_url = "https://www.google.com/search"
+    elif engine == "bing":
+        base_url = "https://www.bing.com/search"
+    else:
+        raise ValueError(f"Unknown engine {engine}")
+
+    url = "https://api.brightdata.com/request"
+
+    payload = {
+        "zone": "ai_agent2",
+        "url": f"{base_url}?q={quote_plus(query)}&brd_json=1",
+        "format": "raw"
+    }
+
+    full_response = _make_api_request(url, json=payload)
+    if not full_response:
+        return None
+
+    extracted_data = {
+        "knowledge": full_response.get("knowledge", {}),
+        "organic": full_response.get("organic", []),
+    }
+    return extracted_data
+```
+
+<Note>
+The Bright Data zone `"ai_agent2"` must be configured in your Bright Data account. The `brd_json=1` query parameter instructs Bright Data to return a parsed JSON SERP response rather than raw HTML.
+</Note>
+
+---
+
+## `reddit_search_api`
+
+```python
+def reddit_search_api(keyword, date="All time", sort_by="Hot", num_of_posts=75):
+```
+
+Triggers a Bright Data dataset job that searches Reddit by keyword and returns a list of matching post titles and URLs.
+
+Internally calls `_trigger_and_download_snapshot` with dataset `gd_lvz8ah06191smkebj4`.
+
+### Parameters
+
+<ParamField path="keyword" type="string" required>
+  The search keyword to pass to the Reddit dataset crawler.
+</ParamField>
+
+<ParamField path="date" type="string" default="All time">
+  Time range filter for posts. Passed directly to the dataset payload.
+</ParamField>
+
+<ParamField path="sort_by" type="string" default="Hot">
+  Sort order for returned posts. Passed directly to the dataset payload.
+</ParamField>
+
+<ParamField path="num_of_posts" type="integer" default="75">
+  Maximum number of Reddit posts to retrieve.
+</ParamField>
+
+### Returns
+
+<ResponseField name="parsed_posts" type="list">
+  Array of objects, each containing:
+  - `title` (string): post title
+  - `url` (string): full Reddit post URL
+</ResponseField>
+
+<ResponseField name="total_found" type="integer">
+  Total number of posts returned by the dataset job.
+</ResponseField>
+
+Returns `None` if the snapshot trigger, polling, or download fails.
+
+### Source
+
+```python
+def reddit_search_api(keyword, date="All time", sort_by="Hot", num_of_posts=75):
+    trigger_url = "https://api.brightdata.com/datasets/v3/trigger"
+
+    params = {
+        "dataset_id": "gd_lvz8ah06191smkebj4",
+        "include_errors": "true",
+        "type": "discover_new",
+        "discover_by": "keyword"
+    }
+
+    data = [
+        {
+            "keyword": keyword,
+            "date": date,
+            "sort_by": sort_by,
+            "num_of_posts": num_of_posts,
+        }
+    ]
+
+    raw_data = _trigger_and_download_snapshot(
+        trigger_url, params, data, operation_name="reddit"
+    )
+
+    if not raw_data:
+        return None
+
+    parsed_data = []
+    for post in raw_data:
+        parsed_post = {
+            "title": post.get("title"),
+            "url": post.get("url")
+        }
+        parsed_data.append(parsed_post)
+
+    return {"parsed_posts": parsed_data, "total_found": len(parsed_data)}
+```
+
+---
+
+## `reddit_post_retrieval`
+
+```python
+def reddit_post_retrieval(urls, days_back=10, load_all_replies=False, comment_limit=""):
+```
+
+Retrieves comments and post content for a list of Reddit URLs using the Bright Data dataset `gd_lvzdpsdlw09j6t702`.
+
+Internally calls `_trigger_and_download_snapshot` once per batch with all URLs.
+
+### Parameters
+
+<ParamField path="urls" type="list[string]" required>
+  List of full Reddit post URLs to retrieve. Returns `None` immediately if this list is empty.
+</ParamField>
+
+<ParamField path="days_back" type="integer" default="10">
+  Only retrieve comments posted within this many days.
+</ParamField>
+
+<ParamField path="load_all_replies" type="boolean" default="false">
+  When `True`, fetches all nested reply threads. When `False`, returns top-level comments only.
+</ParamField>
+
+<ParamField path="comment_limit" type="string" default="">
+  Maximum number of comments to return per post. An empty string means unlimited.
+</ParamField>
+
+### Returns
+
+<ResponseField name="comments" type="list">
+  Array of comment objects, each containing:
+  - `comment_id` (string): unique identifier for the comment
+  - `content` (string): comment text
+  - `date` (string): date the comment was posted
+</ResponseField>
+
+<ResponseField name="total_retrieved" type="integer">
+  Total number of comment records returned.
+</ResponseField>
+
+Returns `None` if the snapshot pipeline fails or `urls` is empty.
+
+### Source
+
+```python
+def reddit_post_retrieval(urls, days_back=10, load_all_replies=False, comment_limit=""):
+    if not urls:
+        return None
+
+    trigger_url = "https://api.brightdata.com/datasets/v3/trigger"
+
+    params = {
+        "dataset_id": "gd_lvzdpsdlw09j6t702",
+        "include_errors": "true"
+    }
+
+    data = [
+        {
+            "url": url,
+            "days_back": days_back,
+            "load_all_replies": load_all_replies,
+            "comment_limit": comment_limit
+        }
+        for url in urls
+    ]
+
+    raw_data = _trigger_and_download_snapshot(
+        trigger_url, params, data, operation_name="reddit comments"
+    )
+    if not raw_data:
+        return None
+
+    parsed_comments = []
+    for comment in raw_data:
+        parsed_comment = {
+            "comment_id": comment.get("comment_id"),
+            "content": comment.get("comment"),
+            "date": comment.get("date_posted"),
+        }
+        parsed_comments.append(parsed_comment)
+
+    return {"comments": parsed_comments, "total_retrieved": len(parsed_comments)}
+```
+
+---
+
+## Private helpers
+
+These functions are not part of the public API but are documented here for contributors.
+
+### `_make_api_request`
+
+```python
+def _make_api_request(url, **kwargs):
+```
+
+All outbound POST requests go through this helper. It reads `BRIGHTDATA_API_KEY` from the environment, injects a `Bearer` auth header, calls `requests.post`, and returns the parsed JSON response. Returns `None` on any `RequestException` or unexpected error.
+
+### `_trigger_and_download_snapshot`
+
+```python
+def _trigger_and_download_snapshot(trigger_url, params, data, operation_name="operation"):
+```
+
+Orchestrates the three-step Bright Data async dataset pattern:
+
+1. **Trigger** — POSTs to the dataset trigger endpoint to start a crawl job and receive a `snapshot_id`.
+2. **Poll** — Calls `poll_snapshot_status(snapshot_id)` until the status is `"ready"` or a failure/timeout occurs.
+3. **Download** — Calls `download_snapshot(snapshot_id)` to fetch the completed dataset.
+
+Returns the raw downloaded data, or `None` if any step fails.

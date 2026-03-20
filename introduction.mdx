@@ -1,0 +1,93 @@
+---
+title: Introduction
+description: A production-grade multi-source AI research agent that orchestrates parallel live searches across Google, Bing, and Reddit, then synthesizes results using GPT-4 into cited, structured answers.
+---
+
+# Deep Research Agent
+
+The Deep Research Agent is a graph-based AI assistant that replaces hours of manual research with a single query. It pulls live data from Google, Bing, and Reddit simultaneously via [Bright Data](https://brightdata.com), analyzes each source independently with GPT-4, and delivers a synthesized answer with full citations — all in about a minute.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get the agent running locally in minutes
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/architecture/overview">
+    Understand how the LangGraph workflow is structured
+  </Card>
+  <Card title="Core Concepts" icon="brain" href="/concepts/multi-source-search">
+    Learn how parallel search and synthesis work
+  </Card>
+  <Card title="API Reference" icon="code" href="/reference/graph-nodes">
+    Explore every node, function, and schema
+  </Card>
+</CardGroup>
+
+## Why Deep Research Agent?
+
+Most LLM assistants rely on a single API or a cached knowledge corpus. This leads to incomplete, biased, or outdated answers — especially for competitive analysis, market research, or real-world decision-making.
+
+The Deep Research Agent solves this by:
+
+- Querying **multiple live sources** in parallel (Google SERPs, Bing SERPs, Reddit threads)
+- Reliably scraping and normalizing results including Reddit posts and comments
+- Applying **layered LLM analysis** — per-source summaries, then cross-source synthesis
+- Enforcing **typed outputs with citations** for every claim, making answers auditable
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Parallel multi-source search" icon="magnifying-glass">
+    Google, Bing, and Reddit are queried simultaneously via Bright Data, cutting research time by up to 10×.
+  </Card>
+  <Card title="Async snapshot handling" icon="rotate">
+    Trigger → poll → download pattern with exponential backoff handles slow Reddit crawls reliably.
+  </Card>
+  <Card title="Layered LLM analysis" icon="layer-group">
+    Each source is summarized independently before a higher-capacity model synthesizes a final answer.
+  </Card>
+  <Card title="LangGraph orchestration" icon="sitemap">
+    Deterministic node wiring with typed state ensures reproducible, testable, retryable pipelines.
+  </Card>
+  <Card title="Pydantic structured outputs" icon="shield-check">
+    Every LLM response is validated against a typed schema — URLs, scores, summaries, and citations.
+  </Card>
+  <Card title="Modular and extensible" icon="puzzle-piece">
+    Add new sources (Twitter, news APIs, academic databases) by implementing one new node function.
+  </Card>
+</CardGroup>
+
+## How it works
+
+```
+User Query
+    │
+    ▼
+LangGraph Controller (State)
+    ├─ Parallel: google_search, bing_search, reddit_search
+    ├─ analyze_reddit_posts  →  retrieve_reddit_posts
+    ├─ Parallel: analyze_google_results, analyze_bing_results, analyze_reddit_results
+    └─ synthesize_analyses  →  Final Answer (with citations)
+```
+
+The agent runs three live searches in parallel, then retrieves full Reddit post data for the most relevant threads. Independent per-source analysis nodes run in parallel before a final synthesis node merges everything into a structured, cited response.
+
+## Tech stack
+
+| Component | Technology |
+|-----------|-----------|
+| Orchestration | [LangGraph](https://langchain-ai.github.io/langgraph/) |
+| LLM | OpenAI GPT-4o |
+| Web scraping | [Bright Data](https://brightdata.com) |
+| Data validation | [Pydantic](https://docs.pydantic.dev/) |
+| Language | Python 3.13+ |
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Get started" icon="play" href="/quickstart">
+    Install dependencies and run your first query
+  </Card>
+  <Card title="Configuration" icon="gear" href="/configuration">
+    Set up API keys and environment variables
+  </Card>
+</CardGroup>

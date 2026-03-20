@@ -1,0 +1,147 @@
+---
+title: "Multi-source search"
+description: "How the agent queries Google, Bing, and Reddit simultaneously using Bright Data"
+---
+
+# Multi-source search
+
+The Deep Research Agent queries three distinct sources in parallel — Google, Bing, and Reddit — within a single research pipeline. This parallel approach reduces total latency and eliminates the blind spots that arise from any single source.
+
+## Why multiple sources?
+
+Each source has distinct strengths:
+
+| Source | Strengths |
+|--------|----------|
+| **Google** | Authoritative results, official docs, statistics, news |
+| **Bing** | Complementary rankings, technical resources, Microsoft ecosystem content |
+| **Reddit** | Real user experiences, community consensus, niche discussions, sentiment |
+
+Using all three together gives the synthesizer node a richer, more balanced picture than any single SERP or forum alone.
+
+## Parallel execution in LangGraph
+
+Three edges from `START` fan out simultaneously:
+
+```python main.py
+graph_builder.add_edge(START, "google_search")
+graph_builder.add_edge(START, "bing_search")
+graph_builder.add_edge(START, "reddit_search")
+```
+
+LangGraph executes these three nodes concurrently. The pipeline does not proceed until all three have written their results into the shared `State`.
+
+## SERP search via Bright Data
+
+Both Google and Bing searches use `serp_search()` from `web_operations.py`. The function posts to the Bright Data request API:
+
+```python web_operations.py
+def serp_search(query, engine="google"):
+    if engine == "google":
+        base_url = "https://www.google.com/search"
+    elif engine == "bing":
+        base_url = "https://www.bing.com/search"
+    else:
+        raise ValueError(f"Unknown engine {engine}")
+
+    url = "https://api.brightdata.com/request"
+
+    payload = {
+        "zone": "ai_agent2",
+        "url": f"{base_url}?q={quote_plus(query)}&brd_json=1",
+        "format": "raw"
+    }
+
+    full_response = _make_api_request(url, json=payload)
+    if not full_response:
+        return None
+
+    extracted_data = {
+        "knowledge": full_response.get("knowledge", {}),
+        "organic": full_response.get("organic", []),
+    }
+    return extracted_data
+```
+
+The `brd_json=1` query parameter instructs Bright Data to return structured JSON output instead of raw HTML — including parsed organic results and knowledge panel data.
+
+### SERP response structure
+
+```python
+{
+    "knowledge": {  # knowledge panel / featured snippet data
+        "title": "...",
+        "description": "...",
+        # ...
+    },
+    "organic": [  # ranked organic results
+        {
+            "title": "...",
+            "url": "...",
+            "description": "..."
+        },
+        # ...
+    ]
+}
+```
+
+<Note>
+The `ai_agent2` zone must exist in your Bright Data account. Bright Data handles CAPTCHA solving, IP rotation, and Cloudflare bypass automatically within the zone.
+</Note>
+
+## Reddit search via Bright Data Datasets API
+
+Reddit search uses a different Bright Data API — the Datasets API — which triggers an asynchronous crawl job:
+
+```python web_operations.py
+def reddit_search_api(keyword, date="All time", sort_by="Hot", num_of_posts=75):
+    trigger_url = "https://api.brightdata.com/datasets/v3/trigger"
+
+    params = {
+        "dataset_id": "gd_lvz8ah06191smkebj4",
+        "include_errors": "true",
+        "type": "discover_new",
+        "discover_by": "keyword"
+    }
+
+    data = [
+        {
+            "keyword": keyword,
+            "date": date,
+            "sort_by": sort_by,
+            "num_of_posts": num_of_posts,
+        }
+    ]
+
+    raw_data = _trigger_and_download_snapshot(
+        trigger_url, params, data, operation_name="reddit"
+    )
+    # ...
+```
+
+Because Reddit crawls are asynchronous, the function triggers a snapshot, then polls until the data is ready. See [Snapshot polling](/concepts/snapshot-polling) for details on this lifecycle.
+
+### Reddit search response structure
+
+```python
+{
+    "parsed_posts": [
+        {"title": "Post title", "url": "https://reddit.com/r/..."},
+        # ...
+    ],
+    "total_found": 75
+}
+```
+
+Only the title and URL are extracted at this stage. Full post data (comments, body text) is fetched later by `retrieve_reddit_posts`.
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Snapshot polling" icon="rotate" href="/concepts/snapshot-polling">
+    How async Reddit crawls are polled and downloaded
+  </Card>
+  <Card title="LLM analysis" icon="brain" href="/concepts/llm-analysis">
+    How each source is analyzed independently
+  </Card>
+</CardGroup>

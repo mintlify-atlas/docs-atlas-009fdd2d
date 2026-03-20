@@ -1,0 +1,168 @@
+---
+title: "LLM analysis"
+description: "How GPT-4o analyzes each search source independently before synthesis"
+---
+
+# LLM analysis
+
+Rather than feeding all raw search results directly to a single LLM prompt, the Deep Research Agent applies **layered analysis**: each source is summarized independently by a dedicated node before a final synthesis step. This improves factual grounding and reduces the cognitive load on the model.
+
+## Why layered analysis?
+
+A single prompt combining Google, Bing, and Reddit results would be very long and force the LLM to simultaneously parse different formats, apply different reasoning heuristics, and produce a coherent synthesis. Breaking analysis into stages:
+
+1. Keeps each prompt focused on a single source type
+2. Allows source-specific instructions (e.g., "quote Reddit users directly")
+3. Produces structured intermediate results that are easier to synthesize
+4. Reduces hallucination risk by grounding each step in its own source data
+
+## The three analysis nodes
+
+### `analyze_google_results`
+
+Focuses on authoritative, factual content:
+
+```python main.py
+def analyze_google_results(state: State):
+    print("Analyzing google search results")
+
+    user_question = state.get("user_question", "")
+    google_results = state.get("google_results", "")
+
+    messages = get_google_analysis_messages(user_question, google_results)
+    reply = llm.invoke(messages)
+
+    return {"google_analysis": reply.content}
+```
+
+The Google analysis system prompt instructs the LLM to extract:
+- Main factual information and authoritative sources
+- Official websites, documentation, and reliable sources
+- Key statistics, dates, and verified information
+- Any conflicting information from different sources
+
+### `analyze_bing_results`
+
+Focuses on complementary perspectives:
+
+```python main.py
+def analyze_bing_results(state: State):
+    print("Analyzing bing search results")
+
+    user_question = state.get("user_question", "")
+    bing_results = state.get("bing_results", "")
+
+    messages = get_bing_analysis_messages(user_question, bing_results)
+    reply = llm.invoke(messages)
+
+    return {"bing_analysis": reply.content}
+```
+
+The Bing analysis prompt focuses on:
+- Additional perspectives not covered by Google
+- Technical details and documentation
+- News articles and recent developments
+- Microsoft ecosystem and enterprise perspectives
+
+### `analyze_reddit_results`
+
+Focuses on community voice and user experience:
+
+```python main.py
+def analyze_reddit_results(state: State):
+    print("Analyzing reddit search results")
+
+    user_question = state.get("user_question", "")
+    reddit_results = state.get("reddit_results", "")
+    reddit_post_data = state.get("reddit_post_data", "")
+
+    messages = get_reddit_analysis_messages(user_question, reddit_results, reddit_post_data)
+    reply = llm.invoke(messages)
+
+    return {"reddit_analysis": reply.content}
+```
+
+This node receives both the initial search result list **and** the full post+comment data fetched by `retrieve_reddit_posts`. The Reddit analysis prompt instructs the LLM to:
+- Quote specific users directly (with quotation marks)
+- Highlight both positive and negative experiences
+- Note the subreddit context for each insight
+- Surface community consensus and outlier opinions
+
+## Two-stage Reddit analysis
+
+Reddit processing has an extra step compared to SERP analysis. Before full post data is fetched, `analyze_reddit_posts` uses structured output to select the most relevant URLs:
+
+```python main.py
+def analyze_reddit_posts(state: State):
+    user_question = state.get("user_question", "")
+    reddit_results = state.get("reddit_results", "")
+
+    if not reddit_results:
+        return {"selected_reddit_urls": []}
+
+    structured_llm = llm.with_structured_output(RedditURLAnalysis)
+    messages = get_reddit_url_analysis_messages(user_question, reddit_results)
+
+    try:
+        analysis = structured_llm.invoke(messages)
+        selected_urls = analysis.selected_urls
+
+        print("Selected URLs:")
+        for i, url in enumerate(selected_urls, 1):
+            print(f"   {i}. {url}")
+
+    except Exception as e:
+        print(e)
+        selected_urls = []
+
+    return {"selected_reddit_urls": selected_urls}
+```
+
+The `RedditURLAnalysis` Pydantic model enforces that the LLM returns a structured list of URLs:
+
+```python main.py
+class RedditURLAnalysis(BaseModel):
+    selected_urls: List[str] = Field(
+        description="List of Reddit URLs that contain valuable information for answering the user's question"
+    )
+```
+
+<Note>
+If `analyze_reddit_posts` fails (e.g., LLM returns malformed output), it falls back to an empty list. This means `retrieve_reddit_posts` will skip the fetch step, and `analyze_reddit_results` will analyze only the initial search result titles and URLs.
+</Note>
+
+## Prompt templates
+
+All prompts are defined in `prompts.py` as static methods on `PromptTemplates`. The `create_message_pair()` helper builds the `[system, user]` message list:
+
+```python prompts.py
+def create_message_pair(system_prompt: str, user_prompt: str) -> list[Dict[str, Any]]:
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+```
+
+See [Prompt templates](/reference/prompt-templates) for the full text of every prompt.
+
+## LLM configuration
+
+All five LLM calls (URL selection + 3 analyses + synthesis) use the same `gpt-4o` model instance:
+
+```python main.py
+from langchain.chat_models import init_chat_model
+llm = init_chat_model("gpt-4o")
+```
+
+<Tip>
+You can reduce costs by using `gpt-4o-mini` for the three source analysis nodes and reserving `gpt-4o` only for the synthesis step. See [Cost optimization](/guides/cost-optimization).
+</Tip>
+
+<CardGroup cols={2}>
+  <Card title="Synthesis" icon="layer-group" href="/concepts/synthesis">
+    How per-source analyses are merged into a final answer
+  </Card>
+  <Card title="Prompt templates reference" icon="code" href="/reference/prompt-templates">
+    Full text of every system and user prompt
+  </Card>
+</CardGroup>

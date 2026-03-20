@@ -1,0 +1,149 @@
+---
+title: "OpenAI integration"
+description: "How the Deep Research Agent uses OpenAI GPT-4o for analysis and synthesis"
+---
+
+The Deep Research Agent uses OpenAI's GPT-4o for all LLM work — URL relevance scoring, per-source analysis, and final synthesis. The model is initialized once at module load time and shared across every node that needs it.
+
+## Setup
+
+### API key
+
+Add your OpenAI API key to your `.env` file:
+
+```bash .env
+OPENAI_API_KEY=your_openai_api_key_here
+```
+
+`main.py` loads this variable at startup via `load_dotenv()` from `python-dotenv`. LangChain reads `OPENAI_API_KEY` from the environment automatically — you do not need to pass it explicitly to any function.
+
+### Model initialization
+
+The agent initializes the model using LangChain's `init_chat_model()` helper:
+
+```python main.py
+from langchain.chat_models import init_chat_model
+
+llm = init_chat_model("gpt-4o")
+```
+
+`init_chat_model()` selects the correct LangChain chat model class based on the model name string and returns a ready-to-use LLM object. The `llm` variable is module-level and shared by all nodes.
+
+## Standard invocation
+
+Most analysis nodes invoke the model with a list of messages and read the `.content` attribute from the response:
+
+```python main.py
+def analyze_google_results(state: State):
+    user_question = state.get("user_question", "")
+    google_results = state.get("google_results", "")
+
+    messages = get_google_analysis_messages(user_question, google_results)
+    reply = llm.invoke(messages)
+
+    return {"google_analysis": reply.content}
+```
+
+The same pattern is used in `analyze_bing_results()` and `analyze_reddit_results()`, and in `synthesize_analyses()`. Each node builds its message list using a function from `prompts.py`, calls `llm.invoke()`, and writes the string result back to state.
+
+## Message format
+
+All nodes build messages using helper functions from `prompts.py` (e.g., `get_google_analysis_messages()`, `get_synthesis_messages()`). Each helper returns a list of `{role, content}` dicts — the standard LangChain message format:
+
+```python
+messages = [
+    {"role": "system", "content": "..."},
+    {"role": "user", "content": "..."},
+]
+```
+
+This is the same structure used to initialize the graph's `messages` field in `State`:
+
+```python main.py
+state = {
+    "messages": [{"role": "user", "content": user_input}],
+    ...
+}
+```
+
+## Structured output
+
+The `analyze_reddit_posts` node uses `llm.with_structured_output()` to enforce a typed Pydantic response instead of free text:
+
+```python main.py
+class RedditURLAnalysis(BaseModel):
+    selected_urls: List[str] = Field(
+        description="List of Reddit URLs that contain valuable information for answering the user's question"
+    )
+
+
+def analyze_reddit_posts(state: State):
+    user_question = state.get("user_question", "")
+    reddit_results = state.get("reddit_results", "")
+
+    if not reddit_results:
+        return {"selected_reddit_urls": []}
+
+    structured_llm = llm.with_structured_output(RedditURLAnalysis)
+    messages = get_reddit_url_analysis_messages(user_question, reddit_results)
+
+    try:
+        analysis = structured_llm.invoke(messages)
+        selected_urls = analysis.selected_urls
+    except Exception as e:
+        print(e)
+        selected_urls = []
+
+    return {"selected_reddit_urls": selected_urls}
+```
+
+`llm.with_structured_output(RedditURLAnalysis)` returns a new LLM object that automatically validates the model's JSON output against the `RedditURLAnalysis` Pydantic schema. The result is a typed Python object — `analysis.selected_urls` is a `List[str]`, not a raw string.
+
+<Note>
+  `with_structured_output()` uses OpenAI's function-calling or JSON mode internally. If the model returns malformed output, the call raises an exception. The `try/except` block in `analyze_reddit_posts` handles this by falling back to an empty URL list rather than crashing the pipeline.
+</Note>
+
+## Token usage per query
+
+Every query triggers exactly five LLM calls:
+
+| Call | Node | Output type |
+|---|---|---|
+| 1 | `analyze_reddit_posts` | `RedditURLAnalysis` (structured) |
+| 2 | `analyze_google_results` | String |
+| 3 | `analyze_bing_results` | String |
+| 4 | `analyze_reddit_results` | String |
+| 5 | `synthesize_analyses` | String |
+
+Calls 2, 3, and 4 run in parallel, so you incur the latency of only one of them — not all three sequentially. Call 5 depends on all three finishing first.
+
+## Changing the model
+
+To use a different OpenAI model, replace `"gpt-4o"` in the `init_chat_model()` call in `main.py`:
+
+```python main.py
+llm = init_chat_model("gpt-4o-mini")   # cheaper, faster
+# or
+llm = init_chat_model("gpt-4-turbo")   # older turbo variant
+```
+
+<Tip>
+  GPT-4o is used for all five nodes by default. For cost optimization, you can split the LLM object: initialize a cheaper model like `gpt-4o-mini` for the three source analysis nodes (calls 2–4) and keep GPT-4o only for the URL selection node (call 1) and the synthesis node (call 5), where output quality matters most. See the [cost optimization guide](/guides/cost-optimization) for details.
+</Tip>
+
+## Error handling
+
+The `analyze_reddit_posts` node wraps `structured_llm.invoke()` in a `try/except Exception` block. If the structured output call fails for any reason — malformed JSON, timeout, API error — the node returns an empty `selected_urls` list and the pipeline continues without crashing. Subsequent nodes handle the empty list gracefully.
+
+For the four standard `llm.invoke()` calls (analysis and synthesis nodes), errors propagate as exceptions. These nodes do not have their own `try/except` blocks, so an OpenAI API failure at that stage will surface as a runtime error.
+
+## Next steps
+
+<Columns cols={2}>
+  <Card title="Bright Data integration" icon="database" href="/integrations/brightdata">
+    How the agent collects live data that GPT-4o then analyses
+  </Card>
+  <Card title="LangGraph integration" icon="sitemap" href="/integrations/langgraph">
+    How the pipeline sequences and parallelises LLM calls
+  </Card>
+</Columns>

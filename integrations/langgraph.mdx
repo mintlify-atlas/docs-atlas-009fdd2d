@@ -1,0 +1,200 @@
+---
+title: "LangGraph integration"
+description: "How the Deep Research Agent uses LangGraph to orchestrate the research pipeline"
+---
+
+LangGraph is the orchestration layer that wires every node in the Deep Research Agent into a single, deterministic execution graph. It handles parallel fan-out, convergence barriers, typed state, and graph compilation — you write plain Python functions and LangGraph handles the rest.
+
+## Version
+
+The project requires `langgraph>=0.6.4`, declared in `pyproject.toml`:
+
+```toml pyproject.toml
+dependencies = [
+    "langchain>=0.3.27",
+    "langchain-openai>=0.3.29",
+    "langgraph>=0.6.4",
+    "python-dotenv>=1.1.1",
+]
+```
+
+## State definition
+
+All data flowing through the graph lives in a single `State` TypedDict declared in `main.py`. LangGraph reads the return dict from each node and merges it into the shared state:
+
+```python main.py
+from typing import Annotated
+from langgraph.graph.message import add_messages
+from typing_extensions import TypedDict
+
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
+    user_question: str | None
+    google_results: str | None
+    bing_results: str | None
+    reddit_results: str | None
+    selected_reddit_urls: list[str] | None
+    reddit_post_data: list | None
+    google_analysis: str | None
+    bing_analysis: str | None
+    reddit_analysis: str | None
+    final_answer: str | None
+```
+
+### The `add_messages` reducer
+
+The `messages` field uses `Annotated[list, add_messages]` instead of a plain `list`. The `add_messages` reducer from `langgraph.graph.message` tells LangGraph to **append** new messages to the existing list rather than replace it. Every other field is replaced on each update — only `messages` accumulates.
+
+<Note>
+  When a node returns `{"messages": [...]}`, LangGraph appends those messages to `State.messages`. When a node returns `{"google_results": "..."}`, LangGraph replaces the previous value. The type annotation on the field determines the merge behavior.
+</Note>
+
+## Graph construction
+
+The graph is built using `StateGraph`, with nodes registered via `add_node()` and edges wired with `add_edge()`:
+
+```python main.py
+from langgraph.graph import StateGraph, START, END
+
+graph_builder = StateGraph(State)
+
+# Register nodes
+graph_builder.add_node("google_search", google_search)
+graph_builder.add_node("bing_search", bing_search)
+graph_builder.add_node("reddit_search", reddit_search)
+graph_builder.add_node("analyze_reddit_posts", analyze_reddit_posts)
+graph_builder.add_node("retrieve_reddit_posts", retrieve_reddit_posts)
+graph_builder.add_node("analyze_google_results", analyze_google_results)
+graph_builder.add_node("analyze_bing_results", analyze_bing_results)
+graph_builder.add_node("analyze_reddit_results", analyze_reddit_results)
+graph_builder.add_node("synthesize_analyses", synthesize_analyses)
+
+# Fan out from START to parallel search nodes
+graph_builder.add_edge(START, "google_search")
+graph_builder.add_edge(START, "bing_search")
+graph_builder.add_edge(START, "reddit_search")
+
+# Converge at URL analysis, then retrieve posts
+graph_builder.add_edge("google_search", "analyze_reddit_posts")
+graph_builder.add_edge("bing_search", "analyze_reddit_posts")
+graph_builder.add_edge("reddit_search", "analyze_reddit_posts")
+graph_builder.add_edge("analyze_reddit_posts", "retrieve_reddit_posts")
+
+# Fan out to parallel analysis nodes
+graph_builder.add_edge("retrieve_reddit_posts", "analyze_google_results")
+graph_builder.add_edge("retrieve_reddit_posts", "analyze_bing_results")
+graph_builder.add_edge("retrieve_reddit_posts", "analyze_reddit_results")
+
+# Converge at synthesis, then end
+graph_builder.add_edge("analyze_google_results", "synthesize_analyses")
+graph_builder.add_edge("analyze_bing_results", "synthesize_analyses")
+graph_builder.add_edge("analyze_reddit_results", "synthesize_analyses")
+graph_builder.add_edge("synthesize_analyses", END)
+
+graph = graph_builder.compile()
+```
+
+## Fan-out and fan-in
+
+The graph has two parallel fan-out/fan-in pairs:
+
+### First fan-out: parallel search
+
+Three edges from `START` create three independent branches that execute concurrently:
+
+```
+START ──► google_search
+      ──► bing_search
+      ──► reddit_search
+```
+
+### First fan-in: synchronization barrier
+
+All three search nodes point to `analyze_reddit_posts`. LangGraph will not run `analyze_reddit_posts` until **all three** incoming edges have resolved — it acts as a synchronization barrier:
+
+```
+google_search  ──►
+bing_search    ──► analyze_reddit_posts
+reddit_search  ──►
+```
+
+### Second fan-out: parallel analysis
+
+After `retrieve_reddit_posts` completes, three edges fan out again to the independent analysis nodes:
+
+```
+retrieve_reddit_posts ──► analyze_google_results
+                      ──► analyze_bing_results
+                      ──► analyze_reddit_results
+```
+
+### Second fan-in: synthesis
+
+All three analysis nodes converge at `synthesize_analyses`, which waits for all three before running:
+
+```
+analyze_google_results  ──►
+analyze_bing_results    ──► synthesize_analyses ──► END
+analyze_reddit_results  ──►
+```
+
+<Tip>
+  You do not write any `async`, `threading`, or `concurrent.futures` code. LangGraph reads the edge graph at compile time and manages concurrency automatically. If a node has no unresolved incoming edges, LangGraph runs it.
+</Tip>
+
+## Compilation
+
+The graph is compiled once at module load time — not inside a function or per-request:
+
+```python main.py
+graph = graph_builder.compile()
+```
+
+Compilation validates the edge graph, checks for unreachable nodes, and prepares the execution plan. Because `graph` is a module-level variable, it is compiled once when Python imports `main.py` and reused for every subsequent `graph.invoke()` call.
+
+## Invocation
+
+The agent invokes the graph synchronously:
+
+```python main.py
+final_state = graph.invoke(state)
+```
+
+`graph.invoke()` runs the full pipeline and returns the complete final state dict once `synthesize_analyses` writes to `END`. The caller reads the answer from `final_state.get("final_answer")`.
+
+## Node contract
+
+Every node function follows the same interface: it accepts the full `State` dict and returns a partial dict containing only the fields it is responsible for writing:
+
+```python main.py
+def analyze_google_results(state: State):
+    user_question = state.get("user_question", "")
+    google_results = state.get("google_results", "")
+
+    messages = get_google_analysis_messages(user_question, google_results)
+    reply = llm.invoke(messages)
+
+    return {"google_analysis": reply.content}
+```
+
+LangGraph merges the returned dict into the shared state. Nodes never write to fields outside their own scope and never mutate state in place.
+
+## Why LangGraph
+
+- **Deterministic wiring** — the execution order is defined by the edge graph, not implicit call order
+- **Typed state** — all data is declared in `State`; you always know what shape the data is and which node wrote it
+- **Parallel execution** — fan-out and fan-in are expressed as edges; no threading code required
+- **Convergence barriers** — nodes with multiple incoming edges wait automatically for all predecessors
+- **Testability** — each node is a plain Python function; you can call and unit-test it without running the graph
+- **Production-ready** — `graph.invoke()` is synchronous and stateless; deploy it anywhere Python runs
+
+## Next steps
+
+<Columns cols={2}>
+  <Card title="Architecture overview" icon="diagram-project" href="/architecture/overview">
+    See the full pipeline design and layer-by-layer breakdown
+  </Card>
+  <Card title="State management" icon="database" href="/architecture/state-management">
+    Understand how the typed State TypedDict flows through every node
+  </Card>
+</Columns>

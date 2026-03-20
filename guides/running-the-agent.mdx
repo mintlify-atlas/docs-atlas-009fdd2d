@@ -1,0 +1,176 @@
+---
+title: "Running the agent"
+description: "Step-by-step guide to running the Deep Research Agent interactively and programmatically"
+---
+
+The Deep Research Agent has two entry points: an interactive chatbot loop for ad-hoc queries, and a direct graph invocation API for programmatic use.
+
+## Interactive mode
+
+The `run_chatbot()` function in `main.py` starts a read-eval-print loop that accepts questions from the terminal and prints the synthesized answer after each research cycle.
+
+```python main.py
+def run_chatbot():
+    print("Multi-Source Research Agent")
+    print("Type 'exit' to quit\n")
+
+    while True:
+        user_input = input("Ask me anything: ")
+        if user_input.lower() == "exit":
+            print("Bye")
+            break
+
+        state = {
+            "messages": [{"role": "user", "content": user_input}],
+            "user_question": user_input,
+            "google_results": None,
+            "bing_results": None,
+            "reddit_results": None,
+            "selected_reddit_urls": None,
+            "reddit_post_data": None,
+            "google_analysis": None,
+            "bing_analysis": None,
+            "reddit_analysis": None,
+            "final_answer": None,
+        }
+
+        print("\nStarting parallel research process...")
+        print("Launching Google, Bing, and Reddit searches...\n")
+        final_state = graph.invoke(state)
+
+        if final_state.get("final_answer"):
+            print(f"\nFinal Answer:\n{final_state.get('final_answer')}\n")
+
+        print("-" * 80)
+```
+
+To start the agent, run:
+
+```bash
+python main.py
+```
+
+You will see the prompt:
+
+```
+Multi-Source Research Agent
+Type 'exit' to quit
+
+Ask me anything:
+```
+
+Type any research question and press Enter. To exit the loop, type `exit`.
+
+<Note>
+  Each question starts a fresh research cycle. The agent resets all state fields to `None` before invoking the graph, so previous results do not carry over between questions in interactive mode.
+</Note>
+
+## Programmatic usage
+
+You can invoke the compiled graph directly from your own Python code without going through the chatbot loop. Import the `graph` object from `main.py` and call `graph.invoke()` with a fully initialized state dict.
+
+```python
+from main import graph
+
+state = {
+    "messages": [{"role": "user", "content": "What are the best practices for container security?"}],
+    "user_question": "What are the best practices for container security?",
+    "google_results": None,
+    "bing_results": None,
+    "reddit_results": None,
+    "selected_reddit_urls": None,
+    "reddit_post_data": None,
+    "google_analysis": None,
+    "bing_analysis": None,
+    "reddit_analysis": None,
+    "final_answer": None,
+}
+
+final_state = graph.invoke(state)
+print(final_state["final_answer"])
+```
+
+<Warning>
+  Always initialize every state key explicitly. Passing a partial dict can cause LangGraph to raise a `KeyError` inside a node that expects a key to exist.
+</Warning>
+
+## Understanding the console output
+
+As the graph runs, it prints log lines to stdout. Here is what each line means:
+
+| Log line | Source | Meaning |
+|---|---|---|
+| `Searching Google for: …` | `google_search` node | Google SERP request sent to Bright Data |
+| `Searching Bing for: …` | `bing_search` node | Bing SERP request sent to Bright Data |
+| `Searching Reddit for: …` | `reddit_search` node | Reddit snapshot job triggered |
+| `⏳ Checking snapshot progress… (attempt N/60)` | `poll_snapshot_status` | Polling the Bright Data progress endpoint |
+| `🔄 Still processing…` | `poll_snapshot_status` | Snapshot job has `status: running`; will retry after 5 s |
+| `✅ Snapshot completed!` | `poll_snapshot_status` | Snapshot job has `status: ready`; download will begin |
+| `❌ Snapshot failed` | `poll_snapshot_status` | Bright Data returned `status: failed` |
+| `❓ Unknown status: …` | `poll_snapshot_status` | Unexpected status string from the API |
+| `📥 Downloading snapshot data…` | `download_snapshot` | Fetching the completed snapshot payload |
+| `🎉 Successfully downloaded N items` | `download_snapshot` | Snapshot download succeeded |
+| `Selected URLs:` followed by numbered list | `analyze_reddit_posts` | LLM chose these Reddit post URLs for deep retrieval |
+| `Analyzing google search results` | `analyze_google_results` | GPT-4o analyzing raw Google SERP data |
+| `Analyzing bing search results` | `analyze_bing_results` | GPT-4o analyzing raw Bing SERP data |
+| `Analyzing reddit search results` | `analyze_reddit_results` | GPT-4o analyzing Reddit posts and comments |
+| `Combine all results together` | `synthesize_analyses` | GPT-4o synthesizing the three analyses |
+
+## Multi-turn usage
+
+The `State` TypedDict includes a `messages` field annotated with `add_messages`:
+
+```python main.py
+class State(TypedDict):
+    messages: Annotated[list, add_messages]
+    user_question: str | None
+    ...
+```
+
+The `add_messages` reducer **appends** new messages to the existing list rather than replacing it. This means if you invoke the graph multiple times with the same state object, the conversation history accumulates in `messages`.
+
+In contrast, `user_question` is a plain string field with no reducer. Each invocation **replaces** the previous value. To run a follow-up question, update `user_question` in your state and re-invoke the graph:
+
+```python
+# First query
+state["user_question"] = "What are the best practices for container security?"
+state["messages"] = [{"role": "user", "content": state["user_question"]}]
+state = graph.invoke(state)
+
+# Follow-up — messages list now contains the prior turn
+state["user_question"] = "Which of those practices apply to Kubernetes specifically?"
+state["messages"] = [{"role": "user", "content": state["user_question"]}]
+state = graph.invoke(state)
+```
+
+<Tip>
+  Reset the search result fields (`google_results`, `bing_results`, etc.) to `None` between invocations if you want the agent to perform fresh searches for the new question.
+</Tip>
+
+## Final state structure
+
+After `graph.invoke()` returns, the state dict contains these keys populated by the pipeline:
+
+| Key | Type | Description |
+|---|---|---|
+| `messages` | `list` | Full conversation history including the assistant's final answer |
+| `user_question` | `str` | The question that was researched |
+| `google_results` | `dict` | Raw SERP data from Google (`knowledge`, `organic` keys) |
+| `bing_results` | `dict` | Raw SERP data from Bing (`knowledge`, `organic` keys) |
+| `reddit_results` | `dict` | Parsed Reddit posts (`parsed_posts`, `total_found` keys) |
+| `selected_reddit_urls` | `list[str]` | Reddit URLs the LLM selected for deep retrieval |
+| `reddit_post_data` | `dict` | Comments retrieved from selected posts (`comments`, `total_retrieved` keys) |
+| `google_analysis` | `str` | GPT-4o analysis of Google results |
+| `bing_analysis` | `str` | GPT-4o analysis of Bing results |
+| `reddit_analysis` | `str` | GPT-4o analysis of Reddit content |
+| `final_answer` | `str` | Synthesized, cited answer from all three sources |
+
+Access any of these fields directly after the call:
+
+```python
+final_state = graph.invoke(state)
+
+print(final_state["final_answer"])          # The synthesized answer
+print(final_state["selected_reddit_urls"])  # Which Reddit posts were used
+print(final_state["google_analysis"])       # Raw Google analysis before synthesis
+```

@@ -1,0 +1,138 @@
+---
+title: "Architecture overview"
+description: "High-level design of the Deep Research Agent pipeline"
+---
+
+The Deep Research Agent is built as a directed acyclic graph (DAG) of deterministic nodes wired together with [LangGraph](https://langchain-ai.github.io/langgraph/). Each node is a pure function: it reads from the shared `State`, performs a single responsibility, and returns a partial state update. Nothing mutates state in place.
+
+## Pipeline at a glance
+
+```
+User Query
+    │
+    ▼
+LangGraph Controller (State)
+    ├─ Parallel: google_search, bing_search, reddit_search
+    ├─ analyze_reddit_posts  →  retrieve_reddit_posts
+    ├─ Parallel: analyze_google_results, analyze_bing_results, analyze_reddit_results
+    └─ synthesize_analyses  →  Final Answer (with citations)
+```
+
+The pipeline has two parallel fans — one for data collection and one for per-source analysis — connected by two sequential checkpoints that gate forward progress.
+
+## Layers and responsibilities
+
+### Layer 1 — Parallel search
+
+Three nodes (`google_search`, `bing_search`, `reddit_search`) run simultaneously as soon as the graph starts. Each calls a different data source via the Bright Data API and writes its raw results into the shared state. None of these nodes depend on each other, so they execute in parallel, cutting total search latency to roughly the slowest of the three.
+
+### Layer 2 — Reddit URL selection
+
+`analyze_reddit_posts` is the first convergence point. LangGraph waits until all three search nodes have finished before running it. The node uses a structured LLM call (enforced by `RedditURLAnalysis`) to select the Reddit thread URLs most relevant to the user's question.
+
+### Layer 3 — Full post retrieval
+
+`retrieve_reddit_posts` fetches the full content — post body and comments — for the URLs selected in the previous step. This is a sequential checkpoint: it runs once, then fans out.
+
+### Layer 4 — Parallel per-source analysis
+
+Three analysis nodes (`analyze_google_results`, `analyze_bing_results`, `analyze_reddit_results`) run in parallel. Each node receives the raw data for its own source plus the user question, invokes GPT-4o with a source-specific prompt, and writes a textual analysis back to state.
+
+### Layer 5 — Cross-source synthesis
+
+`synthesize_analyses` is the second convergence point. It waits for all three analysis nodes, then passes all three analyses to GPT-4o with a synthesis prompt that resolves conflicts, identifies common themes, and attributes claims by source. Its output is the `final_answer` written to both the state field and the `messages` list.
+
+## Full graph wiring
+
+The complete node registration and edge definitions from `main.py`:
+
+```python main.py
+graph_builder = StateGraph(State)
+
+# Register nodes
+graph_builder.add_node("google_search", google_search)
+graph_builder.add_node("bing_search", bing_search)
+graph_builder.add_node("reddit_search", reddit_search)
+graph_builder.add_node("analyze_reddit_posts", analyze_reddit_posts)
+graph_builder.add_node("retrieve_reddit_posts", retrieve_reddit_posts)
+graph_builder.add_node("analyze_google_results", analyze_google_results)
+graph_builder.add_node("analyze_bing_results", analyze_bing_results)
+graph_builder.add_node("analyze_reddit_results", analyze_reddit_results)
+graph_builder.add_node("synthesize_analyses", synthesize_analyses)
+
+# Fan out from START to parallel search nodes
+graph_builder.add_edge(START, "google_search")
+graph_builder.add_edge(START, "bing_search")
+graph_builder.add_edge(START, "reddit_search")
+
+# Converge at URL analysis, then retrieve posts
+graph_builder.add_edge("google_search", "analyze_reddit_posts")
+graph_builder.add_edge("bing_search", "analyze_reddit_posts")
+graph_builder.add_edge("reddit_search", "analyze_reddit_posts")
+graph_builder.add_edge("analyze_reddit_posts", "retrieve_reddit_posts")
+
+# Fan out to parallel analysis nodes
+graph_builder.add_edge("retrieve_reddit_posts", "analyze_google_results")
+graph_builder.add_edge("retrieve_reddit_posts", "analyze_bing_results")
+graph_builder.add_edge("retrieve_reddit_posts", "analyze_reddit_results")
+
+# Converge at synthesis, then end
+graph_builder.add_edge("analyze_google_results", "synthesize_analyses")
+graph_builder.add_edge("analyze_bing_results", "synthesize_analyses")
+graph_builder.add_edge("analyze_reddit_results", "synthesize_analyses")
+graph_builder.add_edge("synthesize_analyses", END)
+
+graph = graph_builder.compile()
+```
+
+## Design principles
+
+### Deterministic, pure-function nodes
+
+Every node follows the same contract:
+
+1. **Read** — extract what you need from `state` using `.get()`
+2. **Update** — compute your result
+3. **Return** — return a `dict` containing only the fields you are responsible for
+
+Nodes never modify state in place and never write to fields outside their scope. This makes each node independently testable and makes the execution order predictable.
+
+### Typed state
+
+All data flowing through the graph is declared in a single `State` TypedDict. Every field has an explicit type annotation. You always know what shape the data is and which node wrote it.
+
+### Modular extensibility
+
+Adding a new data source is three steps:
+
+1. Write a new search node function that returns a new state field
+2. Write a new analysis node function that consumes that field
+3. Register both with `add_node` and wire them with `add_edge`
+
+No existing node needs to change.
+
+### Why parallel execution matters
+
+The three search operations each make external API calls with non-trivial latency:
+
+- `google_search` and `bing_search` each make a synchronous request to the Bright Data SERP API
+- `reddit_search` triggers a Bright Data dataset snapshot, then polls until it completes (up to 60 × 5 s = 5 minutes in the worst case)
+
+Running all three sequentially would add these latencies. Running them in parallel means the total wait time is bounded by the slowest single source, not the sum of all three.
+
+The same logic applies to the second parallel fan (`analyze_google_results`, `analyze_bing_results`, `analyze_reddit_results`): three independent GPT-4o calls that would otherwise queue up sequentially.
+
+<Note>
+  LangGraph manages parallelism automatically based on the edge graph — you do not write any async or threading code. If multiple nodes have no unresolved incoming edges, LangGraph runs them concurrently.
+</Note>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="LangGraph workflow" icon="diagram-project" href="/architecture/langgraph-workflow">
+    See how each node and edge is wired in the compiled graph
+  </Card>
+  <Card title="State management" icon="database" href="/architecture/state-management">
+    Understand the typed State TypedDict and how data flows between nodes
+  </Card>
+</CardGroup>

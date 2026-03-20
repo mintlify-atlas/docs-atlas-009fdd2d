@@ -1,0 +1,134 @@
+---
+title: "Configuration"
+description: "Configure API keys, search parameters, and agent behavior"
+---
+
+The Deep Research Agent is configured through environment variables and a small number of hardcoded defaults in the source files. This page covers every configurable value.
+
+## Environment variables
+
+Create a `.env` file in the project root. The agent loads it automatically via `python-dotenv` on startup.
+
+<Warning>
+  Never commit your `.env` file to version control. Add `.env` to your `.gitignore` to prevent accidentally exposing your API keys.
+</Warning>
+
+```bash .env
+BRIGHTDATA_API_KEY=your_brightdata_api_key_here
+OPENAI_API_KEY=your_openai_api_key_here
+```
+
+<ParamField path="BRIGHTDATA_API_KEY" type="string" required>
+  Your Bright Data API key, used to authenticate requests for SERP scraping (Google and Bing) and Reddit dataset snapshots. Retrieve it from the [Bright Data dashboard](https://brightdata.com).
+</ParamField>
+
+<ParamField path="OPENAI_API_KEY" type="string" required>
+  Your OpenAI API key, used for all GPT-4o LLM calls — per-source analysis and final synthesis. Retrieve it from the [OpenAI platform](https://platform.openai.com/api-keys).
+</ParamField>
+
+## LLM configuration
+
+The LLM is initialized in `main.py` using LangChain's `init_chat_model`:
+
+```python main.py
+from langchain.chat_models import init_chat_model
+
+llm = init_chat_model("gpt-4o")
+```
+
+To switch models, change the string passed to `init_chat_model`. For example, to use GPT-4o mini for lower cost:
+
+```python
+llm = init_chat_model("gpt-4o-mini")
+```
+
+You can use any model supported by `langchain-openai`. The same `llm` instance is reused across all analysis nodes (`analyze_google_results`, `analyze_bing_results`, `analyze_reddit_results`, `synthesize_analyses`) and for structured Reddit URL selection.
+
+<Tip>
+  Using a smaller model for per-source analysis and reserving GPT-4o for the final `synthesize_analyses` node reduces cost without significantly affecting answer quality.
+</Tip>
+
+## Reddit search parameters
+
+The `reddit_search_api` function in `web_operations.py` controls how Reddit posts are discovered. These values are passed directly to the Bright Data dataset trigger.
+
+```python web_operations.py
+def reddit_search_api(keyword, date="All time", sort_by="Hot", num_of_posts=75):
+```
+
+<ParamField path="keyword" type="string" required>
+  The search term used to discover Reddit posts. The agent passes `user_question` directly as the keyword.
+</ParamField>
+
+<ParamField path="date" type="string" default="All time">
+  Time filter for Reddit posts. Accepted values match Reddit's native filter options: `"All time"`, `"Past year"`, `"Past month"`, `"Past week"`, `"Past 24 hours"`.
+</ParamField>
+
+<ParamField path="sort_by" type="string" default="Hot">
+  Sort order for returned posts. Accepted values: `"Hot"`, `"New"`, `"Top"`, `"Rising"`.
+</ParamField>
+
+<ParamField path="num_of_posts" type="number" default="75">
+  Maximum number of Reddit posts to retrieve per search. Higher values improve recall but increase snapshot processing time and downstream LLM token usage.
+</ParamField>
+
+## Reddit post retrieval parameters
+
+After the agent selects relevant Reddit URLs, the `reddit_post_retrieval` function fetches the full post content and comments.
+
+```python web_operations.py
+def reddit_post_retrieval(urls, days_back=10, load_all_replies=False, comment_limit=""):
+```
+
+<ParamField path="urls" type="string[]" required>
+  List of Reddit post URLs selected by the LLM in the `analyze_reddit_posts` node.
+</ParamField>
+
+<ParamField path="days_back" type="number" default="10">
+  Limits retrieved comments to those posted within this many days. Increase this value for topics where older discussions are relevant.
+</ParamField>
+
+<ParamField path="load_all_replies" type="boolean" default="false">
+  When `True`, fetches all nested reply chains in addition to top-level comments. This significantly increases snapshot size and processing time.
+</ParamField>
+
+<ParamField path="comment_limit" type="string" default="">
+  Maximum number of comments to retrieve per post. An empty string means no limit. Set a numeric string (e.g., `"100"`) to cap comment volume and reduce cost.
+</ParamField>
+
+## Snapshot polling configuration
+
+Bright Data processes Reddit data asynchronously. The `poll_snapshot_status` function in `snapshot_operations.py` polls the Bright Data API until the snapshot is ready.
+
+```python snapshot_operations.py
+def poll_snapshot_status(
+    snapshot_id: str, max_attempts: int = 60, delay: int = 5
+) -> bool:
+```
+
+<ParamField path="max_attempts" type="number" default="60">
+  Maximum number of polling attempts before the agent gives up and returns `False`. Combined with `delay`, this sets the total timeout: 60 × 5 = **300 seconds (5 minutes)**.
+</ParamField>
+
+<ParamField path="delay" type="number" default="5">
+  Seconds to wait between polling attempts. The agent sleeps for this duration after each `running` or unknown status response.
+</ParamField>
+
+If you need a longer timeout for large Reddit datasets, increase `max_attempts` in `snapshot_operations.py`:
+
+```python
+# Extend timeout to 10 minutes (120 × 5 = 600 seconds)
+if not poll_snapshot_status(snapshot_id, max_attempts=120, delay=5):
+```
+
+## Bright Data dataset IDs
+
+The following Bright Data dataset and zone identifiers are hardcoded in the source. You do not need to change them unless you provision your own custom datasets in Bright Data.
+
+| Purpose | Identifier | Location |
+|---|---|---|
+| Reddit post search | `gd_lvz8ah06191smkebj4` | `web_operations.py` — `reddit_search_api` |
+| Reddit post retrieval | `gd_lvzdpsdlw09j6t702` | `web_operations.py` — `reddit_post_retrieval` |
+| SERP (Google + Bing) | `ai_agent2` (zone) | `web_operations.py` — `serp_search` |
+
+The SERP zone (`ai_agent2`) is passed as the `zone` field in the request payload to `https://api.brightdata.com/request`. The Reddit dataset IDs are passed as the `dataset_id` query parameter to `https://api.brightdata.com/datasets/v3/trigger`.

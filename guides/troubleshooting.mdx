@@ -1,0 +1,197 @@
+---
+title: "Troubleshooting"
+description: "Common issues and how to resolve them"
+---
+
+This page covers the most common failure modes in the Deep Research Agent and how to fix them. Each issue maps directly to observable behavior in the console output or returned state.
+
+## Common issues
+
+<AccordionGroup>
+  <Accordion title="Snapshot timed out — poll_snapshot_status returns False">
+    **Symptom:** You see repeated `⏳ Checking snapshot progress...` lines followed by `⏰ Timeout waiting for snapshot completion`, and the node returns `None`.
+
+    **Cause:** The Bright Data snapshot job did not finish within the allotted time. The default is 60 attempts × 5 seconds = 5 minutes.
+
+    **Fix:**
+
+    1. Check the Bright Data dashboard to find the snapshot job by ID and inspect its status. The snapshot ID is returned by the trigger call and passed to `poll_snapshot_status`.
+    2. If jobs consistently take longer than 5 minutes, increase `max_attempts` or `delay` in `snapshot_operations.py`:
+
+    ```python snapshot_operations.py
+    def poll_snapshot_status(
+        snapshot_id: str, max_attempts: int = 60, delay: int = 5
+    ) -> bool:
+    ```
+
+    For example, to allow up to 10 minutes:
+
+    ```python
+    poll_snapshot_status(snapshot_id, max_attempts=120, delay=5)
+    ```
+
+    3. Check whether your Bright Data account has sufficient concurrency limits. Jobs may queue behind other requests.
+  </Accordion>
+
+  <Accordion title="API request failed — _make_api_request returns None">
+    **Symptom:** You see `API request failed: <error>` in the console. The node that called the failing function returns `None` for its result field.
+
+    **Cause:** The HTTP request to the Bright Data API failed. Common reasons:
+    - `BRIGHTDATA_API_KEY` is missing or incorrect in your `.env` file.
+    - Your Bright Data account has exceeded its quota or is suspended.
+    - Network connectivity issue.
+
+    **Fix:**
+
+    1. Verify your `.env` file contains the correct key:
+
+    ```bash .env
+    BRIGHTDATA_API_KEY=your_brightdata_api_key_here
+    ```
+
+    2. Confirm the key is valid by testing it directly:
+
+    ```bash
+    curl -H "Authorization: Bearer $BRIGHTDATA_API_KEY" \
+      https://api.brightdata.com/zone/get_active_zones
+    ```
+
+    3. Check your Bright Data account dashboard for quota limits or billing issues.
+    4. Inspect the full error message logged by `_make_api_request` for the HTTP status code.
+  </Accordion>
+
+  <Accordion title="analyze_reddit_posts returns empty selected_urls">
+    **Symptom:** The `Selected URLs:` log line appears but the list is empty, or the node returns `{"selected_reddit_urls": []}`.
+
+    **Cause:** Either `reddit_results` is `None` (the Reddit search failed upstream), or the LLM returned a response that could not be parsed into the `RedditURLAnalysis` Pydantic schema.
+
+    **Fix:**
+
+    1. Check that `reddit_results` is populated before `analyze_reddit_posts` runs. The node guards against this:
+
+    ```python main.py
+    def analyze_reddit_posts(state: State):
+        user_question = state.get("user_question", "")
+        reddit_results = state.get("reddit_results", "")
+
+        if not reddit_results:
+            return {"selected_reddit_urls": []}
+    ```
+
+    If `reddit_results` is `None`, the Reddit search step failed — see the "API request failed" issue above.
+
+    2. Verify your `OPENAI_API_KEY` is set correctly. A missing key causes `llm.with_structured_output().invoke()` to raise an exception, which is caught and results in an empty list:
+
+    ```python main.py
+    except Exception as e:
+        print(e)
+        selected_urls = []
+    ```
+
+    3. If the LLM call succeeds but returns no URLs, the Reddit results may not contain posts relevant to the question. Try a broader or different query.
+  </Accordion>
+
+  <Accordion title="serp_search returns None">
+    **Symptom:** `google_results` or `bing_results` in the final state is `None`. You may see `API request failed: ...` in the console before the analysis step.
+
+    **Cause:** The SERP request to Bright Data failed. The most common cause is that the zone name `ai_agent2` does not exist in your Bright Data account, or the API key lacks permission for that zone.
+
+    The zone is hardcoded in `web_operations.py`:
+
+    ```python web_operations.py
+    payload = {
+        "zone": "ai_agent2",
+        "url": f"{base_url}?q={quote_plus(query)}&brd_json=1",
+        "format": "raw"
+    }
+    ```
+
+    **Fix:**
+
+    1. Log in to your Bright Data dashboard and confirm a zone named `ai_agent2` exists under your account.
+    2. If the zone has a different name, update the `"zone"` value in `serp_search()` to match.
+    3. Verify the API key has access to the zone by checking zone-level permissions in the Bright Data dashboard.
+  </Accordion>
+
+  <Accordion title="reddit_post_retrieval returns empty comments">
+    **Symptom:** `reddit_post_data` is empty or contains zero comments. You may see `Successfully got 0 posts` or `Failed to get post data`.
+
+    **Cause:** Either the selected Reddit post URLs are invalid, or the `days_back` window excludes all available comments.
+
+    **Fix:**
+
+    1. Inspect `selected_reddit_urls` in the final state to confirm the URLs are valid Reddit post URLs (e.g., `https://reddit.com/r/python/comments/...`). Invalid URLs will trigger API errors.
+    2. Increase `days_back` if the posts are older than the current window. The default is `10` days:
+
+    ```python web_operations.py
+    def reddit_post_retrieval(urls, days_back=10, load_all_replies=False, comment_limit=""):
+    ```
+
+    Pass a larger value when calling the function:
+
+    ```python
+    reddit_post_data = reddit_post_retrieval(selected_urls, days_back=30)
+    ```
+
+    3. Confirm the Bright Data dataset ID `gd_lvzdpsdlw09j6t702` is accessible in your account. A wrong dataset ID returns no data silently.
+  </Accordion>
+
+  <Accordion title="Final answer is missing citations">
+    **Symptom:** `final_answer` is present but does not reference Google, Bing, or Reddit as sources.
+
+    **Cause:** The synthesis prompt instructs the LLM to cite source types, but it can only do so if the upstream analysis nodes populated their fields. If one or more of `google_analysis`, `bing_analysis`, or `reddit_analysis` is empty or `None`, the synthesis prompt receives incomplete inputs and the LLM omits or fabricates citations.
+
+    The synthesis system prompt requires all three analyses:
+
+    ```python prompts.py
+    @staticmethod
+    def synthesis_system() -> str:
+        return """You are an expert research synthesizer. Combine the provided analyses from different sources...
+    - Cite the source type (Google, Bing, Reddit) for key claims"""
+    ```
+
+    **Fix:**
+
+    1. Check `final_state["google_analysis"]`, `final_state["bing_analysis"]`, and `final_state["reddit_analysis"]` after the run. If any are `None` or empty strings, the corresponding search or analysis node failed.
+    2. Trace back to the failing source node using the console logs (`Analyzing google search results`, etc.) and resolve the underlying issue (usually an API key or zone configuration problem).
+    3. Confirm that `OPENAI_API_KEY` is valid — all three analysis nodes call `llm.invoke()`, and a failure in any of them leaves the analysis field empty.
+  </Accordion>
+</AccordionGroup>
+
+## Reading the log output
+
+The agent uses `print()` statements throughout the codebase. Here is a complete reference for every log symbol:
+
+| Symbol | Log line | Meaning |
+|---|---|---|
+| `⏳` | `Checking snapshot progress... (attempt N/M)` | Polling Bright Data for snapshot readiness |
+| `🔄` | `Still processing...` | Snapshot job is running; waiting `delay` seconds before next poll |
+| `✅` | `Snapshot completed!` | Snapshot is ready for download |
+| `❌` | `Snapshot failed` | Bright Data returned `status: failed` |
+| `❓` | `Unknown status: <value>` | Unexpected status string from the Bright Data API |
+| `⚠️` | `Error checking progress: <error>` | Exception while polling; will retry |
+| `⏰` | `Timeout waiting for snapshot completion` | `max_attempts` exhausted before snapshot finished |
+| `📥` | `Downloading snapshot data...` | Fetching completed snapshot payload |
+| `🎉` | `Successfully downloaded N items` | Snapshot download succeeded |
+
+## Adding structured logging
+
+The current `print()` statements are useful for development but not suitable for production observability. To add structured logging, replace `print()` calls with Python's built-in `logging` module.
+
+Add this near the top of each module:
+
+```python
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+logger = logging.getLogger(__name__)
+```
+
+Then replace calls like `print(f"⏳ Checking snapshot progress...")` with `logger.info("Checking snapshot progress", extra={"attempt": attempt + 1, "max_attempts": max_attempts})`.
+
+<Tip>
+  Use `logging.getLogger(__name__)` in each module so log lines include the originating file name. This makes it much easier to trace which node produced a given log line when running the full graph.
+</Tip>

@@ -1,0 +1,129 @@
+---
+title: "Synthesis and output"
+description: "How the agent combines per-source analyses into a single structured, cited answer"
+---
+
+# Synthesis and output
+
+After the three source-analysis nodes complete, the `synthesize_analyses` node merges all insights into a single comprehensive answer with citations.
+
+## The synthesize_analyses node
+
+```python main.py
+def synthesize_analyses(state: State):
+    print("Combine all results together")
+
+    user_question = state.get("user_question", "")
+    google_analysis = state.get("google_analysis", "")
+    bing_analysis = state.get("bing_analysis", "")
+    reddit_analysis = state.get("reddit_analysis", "")
+
+    messages = get_synthesis_messages(
+        user_question, google_analysis, bing_analysis, reddit_analysis
+    )
+
+    reply = llm.invoke(messages)
+    final_answer = reply.content
+
+    return {"final_answer": final_answer, "messages": [{"role": "assistant", "content": final_answer}]}
+```
+
+The node reads the three analysis strings from state, builds a synthesis prompt, invokes the LLM, and writes the result to both `final_answer` and the `messages` list.
+
+## The synthesis prompt
+
+The synthesis system prompt instructs the LLM to:
+
+```python prompts.py
+"""You are an expert research synthesizer. Combine the provided analyses from different sources to create a comprehensive, well-structured answer.
+
+Your task:
+- Synthesize insights from Google, Bing, and Reddit analyses
+- Identify common themes and conflicting information
+- Present a balanced view incorporating different perspectives
+- Structure the response logically with clear sections
+- Cite the source type (Google, Bing, Reddit) for key claims
+- Highlight any contradictions or uncertainties
+
+Create a comprehensive answer that addresses the user's question from multiple angles."""
+```
+
+The user prompt passes all three analyses together:
+
+```python prompts.py
+f"""Question: {user_question}
+
+Google Analysis: {google_analysis}
+
+Bing Analysis: {bing_analysis}
+
+Reddit Community Analysis: {reddit_analysis}
+
+Please synthesize these analyses into a comprehensive answer that addresses the question from multiple perspectives."""
+```
+
+## Output format
+
+The final answer is plain text with in-line source type citations. For example:
+
+```
+Based on research from Google, Bing, and Reddit:
+
+**Key findings:**
+- According to Google search results, [claim with authoritative source]...
+- Bing results highlight that [complementary finding]...
+- Reddit users in r/[subreddit] note that "[direct quote]"...
+
+**Areas of consensus:** ...
+
+**Conflicting views:** ...
+```
+
+Every material claim is attributed to one of the three source types, making the answer auditable.
+
+## How the final answer is stored
+
+The node returns two state updates:
+
+```python
+return {
+    "final_answer": final_answer,  # stored as a plain string for easy access
+    "messages": [{"role": "assistant", "content": final_answer}]  # appended to conversation history
+}
+```
+
+The `messages` field uses the `add_messages` reducer, so the assistant's answer is appended to the existing message list (which already contains the user's question).
+
+In `run_chatbot()`, the answer is read from `final_state.get("final_answer")`:
+
+```python main.py
+final_state = graph.invoke(state)
+
+if final_state.get("final_answer"):
+    print(f"\nFinal Answer:\n{final_state.get('final_answer')}\n")
+```
+
+## Hallucination mitigation
+
+Several design decisions reduce hallucination risk:
+
+1. **Explicit citation requirement** — the synthesis prompt requires attributing every claim to Google, Bing, or Reddit
+2. **Per-source grounding** — each analysis node only sees its own source's data, preventing cross-contamination
+3. **Structured upstream outputs** — `RedditURLAnalysis` uses Pydantic validation to ensure URL lists are well-formed
+4. **Real-time data** — all results come from live searches, not cached knowledge
+
+## Customizing synthesis behavior
+
+You can tune synthesis behavior by editing `PromptTemplates.synthesis_system()` in `prompts.py`. For example:
+- Ask for a specific output format (bullet points, JSON, markdown headers)
+- Request a confidence score alongside each claim
+- Focus on a specific aspect (e.g., only negative opinions, only technical details)
+
+<CardGroup cols={2}>
+  <Card title="LLM analysis" icon="brain" href="/concepts/llm-analysis">
+    How each source is analyzed before synthesis
+  </Card>
+  <Card title="Prompt templates reference" icon="code" href="/reference/prompt-templates">
+    Edit the synthesis prompt to change output format
+  </Card>
+</CardGroup>

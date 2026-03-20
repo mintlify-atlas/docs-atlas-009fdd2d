@@ -1,0 +1,167 @@
+---
+title: "Snapshot polling"
+description: "How the agent handles asynchronous Bright Data crawls with polling and backoff"
+---
+
+# Snapshot polling
+
+Reddit data is not available instantly. The Bright Data Datasets API works asynchronously: you trigger a crawl job, receive a `snapshot_id`, and then poll until the data is ready. The Deep Research Agent handles this lifecycle automatically.
+
+## The trigger → poll → download lifecycle
+
+```
+Trigger crawl job
+    │
+    ▼
+Receive snapshot_id
+    │
+    ▼
+Poll /progress/{snapshot_id}  ←─────────────┐
+    │                                        │
+    ├─ status == "ready" ──────────────────► Download snapshot
+    ├─ status == "running" ──── wait 5s ────►┘
+    ├─ status == "failed" ───────────────── Return False
+    └─ timeout (300s) ───────────────────── Return False
+```
+
+The `_trigger_and_download_snapshot()` helper in `web_operations.py` orchestrates this flow:
+
+```python web_operations.py
+def _trigger_and_download_snapshot(trigger_url, params, data, operation_name="operation"):
+    trigger_result = _make_api_request(trigger_url, params=params, json=data)
+    if not trigger_result:
+        return None
+
+    snapshot_id = trigger_result.get("snapshot_id")
+    if not snapshot_id:
+        return None
+
+    if not poll_snapshot_status(snapshot_id):
+        return None
+
+    raw_data = download_snapshot(snapshot_id)
+    return raw_data
+```
+
+## Polling with `poll_snapshot_status()`
+
+The polling function checks the snapshot progress endpoint until the job completes or times out:
+
+```python snapshot_operations.py
+def poll_snapshot_status(
+    snapshot_id: str, max_attempts: int = 60, delay: int = 5
+) -> bool:
+    api_key = os.getenv("BRIGHTDATA_API_KEY")
+    progress_url = f"https://api.brightdata.com/datasets/v3/progress/{snapshot_id}"
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    for attempt in range(max_attempts):
+        try:
+            print(
+                f"⏳ Checking snapshot progress... (attempt {attempt + 1}/{max_attempts})"
+            )
+
+            response = requests.get(progress_url, headers=headers)
+            response.raise_for_status()
+
+            progress_data = response.json()
+            status = progress_data.get("status")
+
+            if status == "ready":
+                print("✅ Snapshot completed!")
+                return True
+            elif status == "failed":
+                print("❌ Snapshot failed")
+                return False
+            elif status == "running":
+                print("🔄 Still processing...")
+                time.sleep(delay)
+            else:
+                print(f"❓ Unknown status: {status}")
+                time.sleep(delay)
+
+        except Exception as e:
+            print(f"⚠️ Error checking progress: {e}")
+            time.sleep(delay)
+
+    print("⏰ Timeout waiting for snapshot completion")
+    return False
+```
+
+### Status values
+
+| Status | Meaning | Action |
+|--------|---------|--------|
+| `ready` | Crawl complete, data available | Return `True`, proceed to download |
+| `running` | Crawl in progress | Wait `delay` seconds, retry |
+| `failed` | Crawl failed on Bright Data side | Return `False` |
+| unknown | Unexpected status | Wait `delay` seconds, retry |
+
+### Default timing
+
+With the defaults of `max_attempts=60` and `delay=5`:
+- **Maximum wait time**: 60 × 5 = **300 seconds (5 minutes)**
+- **Typical Reddit crawl**: 30–120 seconds
+
+<Tip>
+If you're hitting timeouts for large Reddit searches, increase `max_attempts` or reduce `num_of_posts` in `reddit_search_api()`. See [Cost optimization](/guides/cost-optimization) for tuning guidance.
+</Tip>
+
+## Downloading with `download_snapshot()`
+
+Once polling returns `True`, the snapshot data is downloaded:
+
+```python snapshot_operations.py
+def download_snapshot(
+    snapshot_id: str, format: str = "json"
+) -> Optional[List[Dict[Any, Any]]]:
+    api_key = os.getenv("BRIGHTDATA_API_KEY")
+    download_url = (
+        f"https://api.brightdata.com/datasets/v3/snapshot/{snapshot_id}?format={format}"
+    )
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    try:
+        print("📥 Downloading snapshot data...")
+
+        response = requests.get(download_url, headers=headers)
+        response.raise_for_status()
+
+        data = response.json()
+        print(
+            f"🎉 Successfully downloaded {len(data) if isinstance(data, list) else 1} items"
+        )
+
+        return data
+
+    except Exception as e:
+        print(f"❌ Error downloading snapshot: {e}")
+        return None
+```
+
+The function returns a list of parsed record dicts, or `None` if the download fails.
+
+## Two snapshot datasets
+
+The agent uses two different Bright Data datasets for Reddit:
+
+| Operation | Dataset ID | Used by |
+|-----------|-----------|--------|
+| Reddit keyword search | `gd_lvz8ah06191smkebj4` | `reddit_search_api()` |
+| Reddit post + comments | `gd_lvzdpsdlw09j6t702` | `reddit_post_retrieval()` |
+
+## Error handling
+
+All errors in the polling and download flow are handled gracefully:
+- Network exceptions during polling are caught and retried (up to `max_attempts`)
+- A `failed` snapshot status causes immediate `False` return — no further retries
+- A `None` return from `poll_snapshot_status` or `download_snapshot` propagates up, and the affected node returns an empty result rather than crashing the pipeline
+
+<CardGroup cols={2}>
+  <Card title="Multi-source search" icon="magnifying-glass" href="/concepts/multi-source-search">
+    How Google, Bing, and Reddit are queried in parallel
+  </Card>
+  <Card title="Troubleshooting" icon="wrench" href="/guides/troubleshooting">
+    Diagnose snapshot timeout and polling failures
+  </Card>
+</CardGroup>

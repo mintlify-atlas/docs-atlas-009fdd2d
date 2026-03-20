@@ -1,0 +1,154 @@
+---
+title: "Cost optimization"
+description: "Strategies to reduce API costs while maintaining research quality"
+---
+
+Every research query incurs two categories of cost: **Bright Data API calls** for live web scraping, and **OpenAI LLM calls** for analysis and synthesis. This guide explains the knobs you can turn to reduce spend while keeping answer quality high.
+
+## Cost drivers
+
+| Cost driver | Where it occurs | Relative cost |
+|---|---|---|
+| Bright Data SERP requests | `serp_search()` — called twice per query (Google + Bing) | Low per call |
+| Bright Data Reddit snapshot trigger | `reddit_search_api()` — one snapshot per query | Medium |
+| Bright Data Reddit post retrieval | `reddit_post_retrieval()` — one snapshot per selected URL batch | Medium–High (depends on post count) |
+| OpenAI source analysis | `analyze_google_results`, `analyze_bing_results`, `analyze_reddit_results` | Medium (3 calls per query) |
+| OpenAI synthesis | `synthesize_analyses` | Medium–High (largest prompt, most tokens) |
+
+## Controlling Reddit depth
+
+Reddit is the most tunable cost driver because you control how many posts to fetch and how deep to go into each thread.
+
+### Limit the number of posts searched
+
+`reddit_search_api` accepts a `num_of_posts` parameter that controls how many Reddit posts Bright Data returns in the initial search snapshot:
+
+```python web_operations.py
+def reddit_search_api(keyword, date="All time", sort_by="Hot", num_of_posts=75):
+    ...
+    data = [
+        {
+            "keyword": keyword,
+            "date": date,
+            "sort_by": sort_by,
+            "num_of_posts": num_of_posts,
+        }
+    ]
+```
+
+The default is `75`. Reducing it to `25`–`30` cuts snapshot size and LLM input tokens for the URL selection step. Call `reddit_search_api` with a lower value when depth is less important than speed and cost:
+
+```python
+reddit_results = reddit_search_api(keyword=user_question, num_of_posts=25)
+```
+
+### Limit comment history with days_back
+
+`reddit_post_retrieval` retrieves comments from selected posts going back `days_back` days:
+
+```python web_operations.py
+def reddit_post_retrieval(urls, days_back=10, load_all_replies=False, comment_limit=""):
+    ...
+    data = [
+        {
+            "url": url,
+            "days_back": days_back,
+            "load_all_replies": load_all_replies,
+            "comment_limit": comment_limit
+        }
+        for url in urls
+    ]
+```
+
+The default is `10` days. For evergreen research topics, cutting to `3`–`5` days reduces the volume of comments retrieved.
+
+### Cap comments per post
+
+`comment_limit` defaults to `""`, which means **unlimited** comments. Set it to a number string to cap how many comments are retrieved per post:
+
+```python
+reddit_post_data = reddit_post_retrieval(selected_urls, comment_limit="50")
+```
+
+This directly controls the token count passed to `analyze_reddit_results` and can significantly reduce LLM input cost on popular threads with hundreds of comments.
+
+### Limit reply depth
+
+`load_all_replies` defaults to `False`, which already limits nested reply traversal. Leave this as `False` unless you specifically need deep thread analysis.
+
+## Using cheaper models for intermediate steps
+
+All nodes currently use the same `gpt-4o` instance initialized at module level:
+
+```python main.py
+llm = init_chat_model("gpt-4o")
+```
+
+The source analysis nodes (`analyze_google_results`, `analyze_bing_results`, `analyze_reddit_results`) process a single source at a time and produce intermediate summaries. These tasks do not require GPT-4o's full capability. You can replace the `llm` call in those nodes with a cheaper model while keeping GPT-4o for the final synthesis.
+
+```python main.py
+llm = init_chat_model("gpt-4o")         # used for synthesis
+fast_llm = init_chat_model("gpt-4o-mini")  # used for per-source analysis
+```
+
+Then substitute `fast_llm` inside the three analysis nodes:
+
+```python
+def analyze_google_results(state: State):
+    print("Analyzing google search results")
+    user_question = state.get("user_question", "")
+    google_results = state.get("google_results", "")
+    messages = get_google_analysis_messages(user_question, google_results)
+    reply = fast_llm.invoke(messages)  # cheaper model
+    return {"google_analysis": reply.content}
+```
+
+### Model selection tradeoffs
+
+| Node | Recommended model | Reasoning |
+|---|---|---|
+| `analyze_google_results` | `gpt-4o-mini` or `gpt-3.5-turbo` | Structured summarization; high volume |
+| `analyze_bing_results` | `gpt-4o-mini` or `gpt-3.5-turbo` | Same task as Google analysis |
+| `analyze_reddit_results` | `gpt-4o-mini` | Longer inputs (comments); accuracy matters more than Google/Bing |
+| `analyze_reddit_posts` (URL selection) | `gpt-4o-mini` | Structured output; straightforward ranking task |
+| `synthesize_analyses` | `gpt-4o` | Final answer quality matters most; context window needed |
+
+<Tip>
+  `gpt-4o-mini` is roughly 15× cheaper per token than `gpt-4o` and performs well on summarization tasks. Reserve `gpt-4o` for synthesis where reasoning across multiple sources matters.
+</Tip>
+
+## Snapshot polling tuning
+
+Each polling attempt in `poll_snapshot_status` waits 5 seconds before retrying, up to 60 attempts (5 minutes total timeout):
+
+```python snapshot_operations.py
+def poll_snapshot_status(
+    snapshot_id: str, max_attempts: int = 60, delay: int = 5
+) -> bool:
+```
+
+If your use case can tolerate faster failures — for example, in a high-throughput batch job where you prefer to skip slow snapshots and retry later — reduce `max_attempts`:
+
+```python
+# Fail after 90 seconds instead of 5 minutes
+if not poll_snapshot_status(snapshot_id, max_attempts=18, delay=5):
+    return None
+```
+
+<Warning>
+  Every snapshot trigger call to Bright Data incurs a charge regardless of whether the snapshot completes successfully. A failed snapshot that exhausted retries still costs money. Tune `max_attempts` based on your observed p95 snapshot completion time, not the absolute minimum.
+</Warning>
+
+## Metrics to track
+
+The README identifies these key metrics for understanding cost and quality:
+
+| Metric | What it tells you |
+|---|---|
+| **Cost per query** | Total spend across Bright Data + OpenAI for a single research run |
+| **End-to-end latency** | Median and p95 time from question to final answer |
+| **Precision / factuality score** | Human-annotated ranking of claims in the final answer |
+| **Recall of relevant sources (%)** | Whether the agent found the most relevant sources for a question |
+| **User satisfaction / accuracy lift** | A/B comparison against human-only research |
+
+Track cost per query by logging the Bright Data job IDs and querying their billing API, and by enabling OpenAI usage tracking in the API response (`usage` field on every completion response).

@@ -1,0 +1,226 @@
+---
+title: "Bright Data integration"
+description: "How the Deep Research Agent uses Bright Data for live SERP and Reddit scraping"
+---
+
+Bright Data is the web data platform that powers all live scraping in the Deep Research Agent. The agent uses two distinct Bright Data APIs: the **request API** for real-time SERP results and the **Datasets API** for Reddit content collected via snapshots.
+
+## What Bright Data provides
+
+<Columns cols={2}>
+  <Card title="SERP scraping" icon="magnifying-glass">
+    Fetches structured Google and Bing search results, bypassing CAPTCHAs, IP bans, and Cloudflare protection automatically.
+  </Card>
+  <Card title="Reddit dataset snapshots" icon="comments">
+    Collects Reddit posts and comments by keyword or URL using Bright Data's managed dataset infrastructure.
+  </Card>
+</Columns>
+
+## Account setup
+
+<Steps>
+  <Step title="Create a Bright Data account">
+    Sign up at [brightdata.com](https://brightdata.com) and navigate to your account dashboard.
+  </Step>
+
+  <Step title="Get your API key">
+    In your Bright Data dashboard, go to **Account settings** → **API tokens** and create a new token.
+  </Step>
+
+  <Step title="Create the SERP zone">
+    Create a zone named **`ai_agent2`** in your Bright Data dashboard. The agent's `serp_search()` function hardcodes this zone name — it must exist in your account or requests will fail.
+
+    <Warning>
+      The zone name `ai_agent2` is hardcoded in `web_operations.py`. If you use a different zone name, update the `"zone"` key in the `serp_search()` payload to match.
+    </Warning>
+  </Step>
+
+  <Step title="Set the environment variable">
+    Add your API key to your `.env` file:
+
+    ```bash .env
+    BRIGHTDATA_API_KEY=your_brightdata_api_key_here
+    ```
+
+    The agent loads this value at startup via `python-dotenv`.
+  </Step>
+</Steps>
+
+## Authentication
+
+All requests to Bright Data APIs use a Bearer token in the `Authorization` header. The `_make_api_request()` helper in `web_operations.py` reads `BRIGHTDATA_API_KEY` from the environment and attaches it to every request:
+
+```python web_operations.py
+def _make_api_request(url, **kwargs):
+    api_key = os.getenv("BRIGHTDATA_API_KEY")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        response = requests.post(url, headers=headers, **kwargs)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"API request failed: {e}")
+        return None
+    except Exception as e:
+        print(f"Unknown error: {e}")
+        return None
+```
+
+All other Bright Data calls — including `poll_snapshot_status()` and `download_snapshot()` in `snapshot_operations.py` — read the same environment variable independently and attach the same Bearer token pattern.
+
+## SERP scraping (Google and Bing)
+
+The agent calls `serp_search()` from `web_operations.py` for both Google and Bing. It sends a single POST to `https://api.brightdata.com/request` with a zone, a fully-formed search URL, and a format directive:
+
+```python web_operations.py
+def serp_search(query, engine="google"):
+    if engine == "google":
+        base_url = "https://www.google.com/search"
+    elif engine == "bing":
+        base_url = "https://www.bing.com/search"
+    else:
+        raise ValueError(f"Unknown engine {engine}")
+
+    url = "https://api.brightdata.com/request"
+
+    payload = {
+        "zone": "ai_agent2",
+        "url": f"{base_url}?q={quote_plus(query)}&brd_json=1",
+        "format": "raw"
+    }
+
+    full_response = _make_api_request(url, json=payload)
+    if not full_response:
+        return None
+
+    extracted_data = {
+        "knowledge": full_response.get("knowledge", {}),
+        "organic": full_response.get("organic", []),
+    }
+    return extracted_data
+```
+
+### The `brd_json=1` flag
+
+Appending `&brd_json=1` to the search URL tells Bright Data to parse the SERP HTML and return structured JSON instead of raw HTML. The agent extracts two top-level keys from the response:
+
+- **`knowledge`** — the knowledge panel (facts, entities, summaries)
+- **`organic`** — the list of organic search result links
+
+<Tip>
+  The `brd_json=1` flag means you never need to parse HTML yourself. Bright Data returns ready-to-use structured data that the agent can pass directly to the LLM analysis nodes.
+</Tip>
+
+## Reddit scraping (Datasets API)
+
+Reddit scraping uses a different Bright Data API — the **Datasets API** — which works on a trigger → poll → download pattern. The agent uses two separate dataset IDs depending on the task:
+
+| Dataset | ID | Used in |
+|---|---|---|
+| Reddit search by keyword | `gd_lvz8ah06191smkebj4` | `reddit_search_api()` |
+| Reddit post and comment retrieval | `gd_lvzdpsdlw09j6t702` | `reddit_post_retrieval()` |
+
+### Snapshot lifecycle
+
+Every Reddit operation follows the same three-step pattern, implemented in `_trigger_and_download_snapshot()`:
+
+<Steps>
+  <Step title="Trigger the snapshot">
+    POST to `https://api.brightdata.com/datasets/v3/trigger` with the dataset ID and your query parameters. Bright Data returns a `snapshot_id`.
+  </Step>
+
+  <Step title="Poll for completion">
+    `poll_snapshot_status()` in `snapshot_operations.py` polls `https://api.brightdata.com/datasets/v3/progress/{snapshot_id}` every 5 seconds, up to 60 attempts (5 minutes total).
+
+    The status field transitions through `running` → `ready` or `failed`.
+  </Step>
+
+  <Step title="Download the results">
+    Once status is `ready`, `download_snapshot()` fetches the data from `https://api.brightdata.com/datasets/v3/snapshot/{snapshot_id}?format=json` and returns a list of records.
+  </Step>
+</Steps>
+
+### Reddit search by keyword
+
+`reddit_search_api()` triggers a discovery snapshot using dataset `gd_lvz8ah06191smkebj4`:
+
+```python web_operations.py
+def reddit_search_api(keyword, date="All time", sort_by="Hot", num_of_posts=75):
+    trigger_url = "https://api.brightdata.com/datasets/v3/trigger"
+
+    params = {
+        "dataset_id": "gd_lvz8ah06191smkebj4",
+        "include_errors": "true",
+        "type": "discover_new",
+        "discover_by": "keyword"
+    }
+
+    data = [
+        {
+            "keyword": keyword,
+            "date": date,
+            "sort_by": sort_by,
+            "num_of_posts": num_of_posts,
+        }
+    ]
+```
+
+The response is parsed down to a list of `{title, url}` dicts — just enough for the LLM to select the most relevant threads in the next node.
+
+### Reddit post and comment retrieval
+
+`reddit_post_retrieval()` fetches full post data for specific URLs using dataset `gd_lvzdpsdlw09j6t702`:
+
+```python web_operations.py
+def reddit_post_retrieval(urls, days_back=10, load_all_replies=False, comment_limit=""):
+    params = {
+        "dataset_id": "gd_lvzdpsdlw09j6t702",
+        "include_errors": "true"
+    }
+
+    data = [
+        {
+            "url": url,
+            "days_back": days_back,
+            "load_all_replies": load_all_replies,
+            "comment_limit": comment_limit
+        }
+        for url in urls
+    ]
+```
+
+The response is parsed to a list of `{comment_id, content, date}` dicts for the Reddit analysis node.
+
+## Error handling
+
+`_make_api_request()` catches `requests.exceptions.RequestException` for all HTTP and network errors, logs the message, and returns `None`. All callers check the return value before proceeding, so a failed Bright Data call produces an empty result rather than a crash.
+
+For snapshot polling, `poll_snapshot_status()` in `snapshot_operations.py` also wraps each poll attempt in a `try/except` so a transient network error doesn't abort the entire wait loop.
+
+<Note>
+  Reddit snapshot collection can take up to 5 minutes in the worst case (60 attempts × 5-second delay). The agent runs the Reddit search in parallel with Google and Bing so this wait does not block those results.
+</Note>
+
+## Benefits of using Bright Data
+
+- **CAPTCHA solving** — handled automatically; you never write CAPTCHA bypass logic
+- **IP rotation** — Bright Data rotates IPs on every request, preventing rate limit blocks
+- **Cloudflare bypass** — managed infrastructure handles JS challenge pages
+- **Structured output** — the `brd_json=1` flag returns parsed SERP data directly; no HTML parsing required
+- **Managed Reddit datasets** — no Reddit API credentials or scraper maintenance needed
+
+## Next steps
+
+<Columns cols={2}>
+  <Card title="OpenAI integration" icon="brain" href="/integrations/openai">
+    How GPT-4o analyses the data Bright Data collects
+  </Card>
+  <Card title="LangGraph integration" icon="sitemap" href="/integrations/langgraph">
+    How the pipeline orchestrates Bright Data calls across parallel nodes
+  </Card>
+</Columns>

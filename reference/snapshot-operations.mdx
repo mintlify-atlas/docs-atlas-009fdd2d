@@ -1,0 +1,154 @@
+---
+title: "Snapshot operations"
+description: "Reference for snapshot_operations.py — async Bright Data snapshot polling and download"
+---
+
+`snapshot_operations.py` contains two functions that handle the asynchronous lifecycle of a Bright Data dataset job after it has been triggered. Both functions authenticate using the `BRIGHTDATA_API_KEY` environment variable.
+
+<Info>
+These functions are called by `_trigger_and_download_snapshot` in `web_operations.py`. You typically don't need to call them directly unless you're building custom dataset pipelines.
+</Info>
+
+---
+
+## `poll_snapshot_status`
+
+```python
+def poll_snapshot_status(
+    snapshot_id: str, max_attempts: int = 60, delay: int = 5
+) -> bool:
+```
+
+Polls the Bright Data progress endpoint at `https://api.brightdata.com/datasets/v3/progress/{snapshot_id}` until the snapshot reaches a terminal status or the attempt limit is reached.
+
+### Parameters
+
+<ParamField path="snapshot_id" type="string" required>
+  The Bright Data snapshot ID returned in the `snapshot_id` field of a dataset trigger response.
+</ParamField>
+
+<ParamField path="max_attempts" type="integer" default="60">
+  Maximum number of polling attempts before giving up. At the default `delay` of 5 seconds, this gives a 5-minute timeout window.
+</ParamField>
+
+<ParamField path="delay" type="integer" default="5">
+  Seconds to wait between each polling attempt.
+</ParamField>
+
+### Returns
+
+`True` when the snapshot status is `"ready"`. `False` if the status is `"failed"`, if all attempts are exhausted, or if an exception occurs.
+
+### Status values
+
+| Status | Behavior |
+|--------|----------|
+| `"ready"` | Returns `True` immediately |
+| `"failed"` | Returns `False` immediately |
+| `"running"` | Waits `delay` seconds and retries |
+| any other value | Waits `delay` seconds and retries |
+
+### Source
+
+```python
+def poll_snapshot_status(
+    snapshot_id: str, max_attempts: int = 60, delay: int = 5
+) -> bool:
+    api_key = os.getenv("BRIGHTDATA_API_KEY")
+    progress_url = f"https://api.brightdata.com/datasets/v3/progress/{snapshot_id}"
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    for attempt in range(max_attempts):
+        try:
+            print(
+                f"⏳ Checking snapshot progress... (attempt {attempt + 1}/{max_attempts})"
+            )
+
+            response = requests.get(progress_url, headers=headers)
+            response.raise_for_status()
+
+            progress_data = response.json()
+            status = progress_data.get("status")
+
+            if status == "ready":
+                print("✅ Snapshot completed!")
+                return True
+            elif status == "failed":
+                print("❌ Snapshot failed")
+                return False
+            elif status == "running":
+                print("🔄 Still processing...")
+                time.sleep(delay)
+            else:
+                print(f"❓ Unknown status: {status}")
+                time.sleep(delay)
+
+        except Exception as e:
+            print(f"⚠️ Error checking progress: {e}")
+            time.sleep(delay)
+
+    print("⏰ Timeout waiting for snapshot completion")
+    return False
+```
+
+<Tip>
+To extend the timeout for large Reddit crawls, increase `max_attempts`. For example, `poll_snapshot_status(snapshot_id, max_attempts=120)` doubles the default window to 10 minutes.
+</Tip>
+
+---
+
+## `download_snapshot`
+
+```python
+def download_snapshot(
+    snapshot_id: str, format: str = "json"
+) -> Optional[List[Dict[Any, Any]]]:
+```
+
+Downloads the completed snapshot data from `https://api.brightdata.com/datasets/v3/snapshot/{snapshot_id}?format={format}` and returns it as a parsed Python list.
+
+Call this only after `poll_snapshot_status` returns `True`.
+
+### Parameters
+
+<ParamField path="snapshot_id" type="string" required>
+  The Bright Data snapshot ID of a completed (status `"ready"`) snapshot job.
+</ParamField>
+
+<ParamField path="format" type="string" default="json">
+  The response format to request. `"json"` is the only format used by the current pipeline.
+</ParamField>
+
+### Returns
+
+A list of record dicts parsed from the JSON response, or `None` if the download fails.
+
+### Source
+
+```python
+def download_snapshot(
+    snapshot_id: str, format: str = "json"
+) -> Optional[List[Dict[Any, Any]]]:
+    api_key = os.getenv("BRIGHTDATA_API_KEY")
+    download_url = (
+        f"https://api.brightdata.com/datasets/v3/snapshot/{snapshot_id}?format={format}"
+    )
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    try:
+        print("📥 Downloading snapshot data...")
+
+        response = requests.get(download_url, headers=headers)
+        response.raise_for_status()
+
+        data = response.json()
+        print(
+            f"🎉 Successfully downloaded {len(data) if isinstance(data, list) else 1} items"
+        )
+
+        return data
+
+    except Exception as e:
+        print(f"❌ Error downloading snapshot: {e}")
+        return None
+```

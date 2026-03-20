@@ -1,0 +1,246 @@
+---
+title: "Extending with new sources"
+description: "How to add new data sources to the research pipeline"
+---
+
+The agent's LangGraph pipeline is designed to be extended. Each data source is a self-contained node that reads from the shared `State`, performs its work, and returns a partial state dict. Adding a new source follows the same repeatable pattern every time.
+
+## Node design pattern
+
+Every node in the graph is a **pure function**: it accepts the current `State` and returns a dict containing only the fields it updates. It does not mutate the state directly, and it has no side effects beyond its API calls.
+
+Here is the pattern from the existing `google_search` node:
+
+```python main.py
+def google_search(state: State):
+    user_question = state.get("user_question", "")
+    print(f"Searching Google for: {user_question}")
+
+    google_results = serp_search(user_question, engine="google")
+
+    return {"google_results": google_results}
+```
+
+Notice:
+- Read from `state` using `.get()` with a safe default.
+- Return only the fields this node is responsible for.
+- Keep the function stateless — no globals, no class instances.
+
+## Adding a new source: Twitter/X example
+
+The steps below show how to add a Twitter/X search node to the pipeline. The same process applies to any other source such as a news API or academic database.
+
+<Steps>
+  <Step title="Add the new field to the State TypedDict">
+    Open `main.py` and add your new field to the `State` class:
+
+    ```python main.py
+    class State(TypedDict):
+        messages: Annotated[list, add_messages]
+        user_question: str | None
+        google_results: str | None
+        bing_results: str | None
+        reddit_results: str | None
+        selected_reddit_urls: list[str] | None
+        reddit_post_data: list | None
+        google_analysis: str | None
+        bing_analysis: str | None
+        reddit_analysis: str | None
+        final_answer: str | None
+        twitter_results: str | None   # <-- add this
+        twitter_analysis: str | None  # <-- and this
+    ```
+  </Step>
+
+  <Step title="Write the search node function">
+    Add a new function that calls your data source and returns the results. Follow the pure-function pattern:
+
+    ```python main.py
+    def twitter_search(state: State):
+        user_question = state.get("user_question", "")
+        print(f"Searching Twitter for: {user_question}")
+        # your scraping/API call here
+        twitter_results = your_twitter_function(user_question)
+        return {"twitter_results": twitter_results}
+    ```
+
+    <Note>
+      If your source requires a Bright Data snapshot (like Reddit does), reuse `_trigger_and_download_snapshot()` from `web_operations.py`. See the [snapshot-based sources](#snapshot-based-sources) section below.
+    </Note>
+  </Step>
+
+  <Step title="Add prompt templates in prompts.py">
+    Add static methods to the `PromptTemplates` class — one for the system prompt, one for the user prompt. Follow the pattern used by the existing sources:
+
+    ```python prompts.py
+    @staticmethod
+    def twitter_analysis_system() -> str:
+        """System prompt for analyzing Twitter/X results."""
+        return """You are an expert at analyzing social media content from Twitter/X.
+    Extract key opinions, trending topics, and notable perspectives that answer the user's question.
+
+    Focus on:
+    - Verified accounts and domain experts
+    - High-engagement posts (likes, retweets)
+    - Emerging trends and real-time reactions
+    - Conflicting viewpoints and debates
+
+    Provide a concise analysis highlighting the most relevant findings."""
+
+    @staticmethod
+    def twitter_analysis_user(user_question: str, twitter_results: str) -> str:
+        """User prompt for analyzing Twitter/X results."""
+        return f"""Question: {user_question}
+
+    Twitter/X Results: {twitter_results}
+
+    Please analyze these results and extract insights relevant to the question."""
+    ```
+  </Step>
+
+  <Step title="Add a convenience message-builder function">
+    Add a convenience function at the bottom of `prompts.py` that follows the same pattern as the existing helpers:
+
+    ```python prompts.py
+    def get_twitter_analysis_messages(
+        user_question: str, twitter_results: str
+    ) -> list[Dict[str, Any]]:
+        """Get messages for Twitter results analysis."""
+        return create_message_pair(
+            PromptTemplates.twitter_analysis_system(),
+            PromptTemplates.twitter_analysis_user(user_question, twitter_results),
+        )
+    ```
+
+    Then import it at the top of `main.py`:
+
+    ```python main.py
+    from prompts import (
+        get_reddit_analysis_messages,
+        get_google_analysis_messages,
+        get_bing_analysis_messages,
+        get_reddit_url_analysis_messages,
+        get_synthesis_messages,
+        get_twitter_analysis_messages,  # <-- add this
+    )
+    ```
+  </Step>
+
+  <Step title="Write the analysis node">
+    Add an analysis node that consumes the raw results and calls the LLM. Follow the pattern used by `analyze_google_results`:
+
+    ```python main.py
+    def analyze_twitter_results(state: State):
+        print("Analyzing Twitter/X results")
+
+        user_question = state.get("user_question", "")
+        twitter_results = state.get("twitter_results", "")
+
+        messages = get_twitter_analysis_messages(user_question, twitter_results)
+        reply = llm.invoke(messages)
+
+        return {"twitter_analysis": reply.content}
+    ```
+  </Step>
+
+  <Step title="Register the nodes with the graph builder">
+    Register both nodes before calling `graph_builder.compile()`:
+
+    ```python main.py
+    graph_builder.add_node("twitter_search", twitter_search)
+    graph_builder.add_node("analyze_twitter_results", analyze_twitter_results)
+    ```
+  </Step>
+
+  <Step title="Wire the edges">
+    Connect the new source into the existing flow. Fan out from `START` alongside the existing searches, then funnel the analysis node into `synthesize_analyses`:
+
+    ```python main.py
+    # Fan out from START
+    graph_builder.add_edge(START, "twitter_search")
+
+    # Twitter search feeds into analyze_reddit_posts (which now waits for all three + Twitter)
+    graph_builder.add_edge("twitter_search", "analyze_reddit_posts")
+
+    # Wire analysis after retrieve_reddit_posts
+    graph_builder.add_edge("retrieve_reddit_posts", "analyze_twitter_results")
+
+    # Converge at synthesis
+    graph_builder.add_edge("analyze_twitter_results", "synthesize_analyses")
+    ```
+
+    <Warning>
+      LangGraph's fan-in behavior means `analyze_reddit_posts` will not run until **all** of its incoming edges have completed. Adding a new edge from `twitter_search` to `analyze_reddit_posts` correctly makes it wait for all four searches.
+    </Warning>
+  </Step>
+
+  <Step title="Update synthesize_analyses to include the new analysis">
+    Extend `synthesize_analyses` to read the new analysis field and pass it to the synthesis prompt:
+
+    ```python main.py
+    def synthesize_analyses(state: State):
+        print("Combine all results together")
+
+        user_question = state.get("user_question", "")
+        google_analysis = state.get("google_analysis", "")
+        bing_analysis = state.get("bing_analysis", "")
+        reddit_analysis = state.get("reddit_analysis", "")
+        twitter_analysis = state.get("twitter_analysis", "")  # <-- add this
+
+        # Update get_synthesis_messages to accept twitter_analysis, or format inline:
+        messages = get_synthesis_messages(
+            user_question, google_analysis, bing_analysis, reddit_analysis
+        )
+        # Append the twitter analysis to the user message content before invoking
+        messages[-1]["content"] += f"\n\nTwitter/X Analysis: {twitter_analysis}"
+
+        reply = llm.invoke(messages)
+        final_answer = reply.content
+
+        return {"final_answer": final_answer, "messages": [{"role": "assistant", "content": final_answer}]}
+    ```
+
+    <Tip>
+      For a cleaner implementation, add a `twitter_analysis` parameter to `PromptTemplates.synthesis_user()` and `get_synthesis_messages()` so the full prompt is always built in one place.
+    </Tip>
+  </Step>
+</Steps>
+
+## Snapshot-based sources
+
+Some sources — like Reddit — require Bright Data to crawl pages asynchronously and return results via a snapshot. If your new source works the same way, reuse `_trigger_and_download_snapshot()` from `web_operations.py` instead of writing your own polling loop.
+
+Here is how the existing `reddit_search_api` uses it:
+
+```python web_operations.py
+def reddit_search_api(keyword, date="All time", sort_by="Hot", num_of_posts=75):
+    trigger_url = "https://api.brightdata.com/datasets/v3/trigger"
+
+    params = {
+        "dataset_id": "gd_lvz8ah06191smkebj4",
+        "include_errors": "true",
+        "type": "discover_new",
+        "discover_by": "keyword"
+    }
+
+    data = [
+        {
+            "keyword": keyword,
+            "date": date,
+            "sort_by": sort_by,
+            "num_of_posts": num_of_posts,
+        }
+    ]
+
+    raw_data = _trigger_and_download_snapshot(
+        trigger_url, params, data, operation_name="reddit"
+    )
+    ...
+```
+
+For your own snapshot-based source, call `_trigger_and_download_snapshot()` with:
+- `trigger_url` — the Bright Data dataset trigger endpoint for your dataset
+- `params` — the `dataset_id` and any filter parameters
+- `data` — the list of input records (keywords, URLs, etc.)
+
+`_trigger_and_download_snapshot()` handles triggering the job, polling `poll_snapshot_status()` until the snapshot is ready, and downloading the result via `download_snapshot()`. You only need to parse the returned `raw_data`.
